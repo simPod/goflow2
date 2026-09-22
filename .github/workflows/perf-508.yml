@@ -1,0 +1,61 @@
+name: Performance isolation 508
+
+on:
+  push:
+    branches: ['perf/508-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select pinned experiment
+        shell: bash
+        run: |
+          case "$GITHUB_REF_NAME" in
+            perf/508-control-v222) go_version=1.23.6 ;;
+            perf/508-v222-go1255|perf/508-control-v226|perf/508-v226-old-protobuf-code|perf/508-v226-old-protobuf-runtime) go_version=1.25.5 ;;
+            *) exit 1 ;;
+          esac
+          echo "GO_VERSION=$go_version" >> "$GITHUB_ENV"
+          echo "VARIANT=${GITHUB_REF_NAME#perf/508-}" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
+          check-latest: false
+      - name: Test and build static Linux amd64 binary
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1
+          GOFLAGS: -mod=readonly
+        run: |
+          test "$(go env GOVERSION)" = "go$GO_VERSION"
+          go test ./...
+          mkdir -p dist
+          binary="goflow2-508-${VARIANT}-linux-amd64"
+          go build -ldflags "-X main.version=perf-508-${VARIANT}-${GITHUB_SHA:0:12} -X main.buildinfos=go${GO_VERSION}" -o "dist/$binary" cmd/goflow2/main.go
+          "dist/$binary" -v
+          go version -m "dist/$binary" > dist/build-info.txt
+          {
+            echo "branch=$GITHUB_REF_NAME"
+            echo "commit=$GITHUB_SHA"
+            echo "go=$GO_VERSION"
+            echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > dist/experiment.txt
+          file "dist/$binary"
+          (cd dist && sha256sum "$binary" > SHA256SUMS)
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goflow2-508-${{ env.VARIANT }}-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
