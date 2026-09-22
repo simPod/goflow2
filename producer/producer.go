@@ -4,6 +4,8 @@ package producer
 import (
 	"net/netip"
 	"time"
+
+	"github.com/netsampler/goflow2/v2/diagnostics"
 )
 
 // ProducerMessage is the generic type returned by producers.
@@ -20,6 +22,8 @@ type ProducerInterface interface {
 
 // ProduceArgs captures metadata about the received packet.
 type ProduceArgs struct {
+	// Diagnostics is nil for disabled/unsampled datagrams and must not be retained.
+	Diagnostics    *diagnostics.Trace
 	Src            netip.AddrPort
 	Dst            netip.AddrPort
 	SamplerAddress netip.Addr

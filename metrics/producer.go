@@ -6,6 +6,7 @@ import (
 	"github.com/netsampler/goflow2/v2/decoders/netflow"
 	"github.com/netsampler/goflow2/v2/decoders/netflowlegacy"
 	"github.com/netsampler/goflow2/v2/decoders/sflow"
+	"github.com/netsampler/goflow2/v2/diagnostics"
 	"github.com/netsampler/goflow2/v2/producer"
 	"github.com/netsampler/goflow2/v2/producer/proto"
 
@@ -22,6 +23,9 @@ func (p *PromProducerWrapper) Produce(msg interface{}, args *producer.ProduceArg
 	flowMessageSet, err := p.wrapped.Produce(msg, args)
 	if err != nil {
 		return flowMessageSet, err
+	}
+	if args != nil {
+		args.Diagnostics.SetStage(diagnostics.ProducerMetrics)
 	}
 	key := args.Src.Addr().Unmap().String()
 	var nfvariant bool

@@ -8,6 +8,7 @@ import (
 
 	"github.com/netsampler/goflow2/v2/decoders/netflow"
 	"github.com/netsampler/goflow2/v2/utils"
+	"github.com/netsampler/goflow2/v2/utils/debug"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -20,6 +21,7 @@ func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFun
 			return fmt.Errorf("flow is not *Message")
 		}
 		remote := pkt.Src.Addr().Unmap().String()
+		pkt.Diagnostics.MarkWrapper()
 		localIP := pkt.Dst.Addr().Unmap().String()
 
 		port := strconv.FormatUint(uint64(pkt.Dst.Port()), 10)
@@ -63,6 +65,9 @@ func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFun
 			Observe(float64((timeTrackStop.Sub(timeTrackStart)).Nanoseconds()) / 1e9)
 
 		if err != nil {
+			if pkt.Diagnostics != nil && errors.Is(err, debug.ErrPanic) {
+				pkt.Diagnostics.MarkPanic()
+			}
 			if errors.Is(err, netflow.ErrorTemplateNotFound) {
 				NetFlowErrors.With(
 					prometheus.Labels{

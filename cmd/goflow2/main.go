@@ -41,10 +41,14 @@ import (
 	rawproducer "github.com/netsampler/goflow2/v2/producer/raw"
 
 	// core libraries
+	"github.com/netsampler/goflow2/v2/diagnostics"
+	"github.com/netsampler/goflow2/v2/diagnostics/profile"
 	"github.com/netsampler/goflow2/v2/metrics"
 	"github.com/netsampler/goflow2/v2/utils"
 	"github.com/netsampler/goflow2/v2/utils/debug"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
@@ -74,6 +78,12 @@ var (
 	MappingFile = flag.String("mapping", "", "Configuration file for custom mappings")
 
 	Version = flag.Bool("v", false, "Print version")
+
+	Diagnostics            = flag.Bool("diagnostics", false, "Expose sampled pipeline, receiver and full Go runtime diagnostics")
+	DiagnosticsSampleEvery = flag.Uint64("diagnostics.sample-every", diagnostics.DefaultSampleEvery, "Sample one datagram per N datagrams per worker (0 uses 1024)")
+	ProfilingAddr          = flag.String("diagnostics.pprof.addr", "", "Optional loopback profiling address, for example 127.0.0.1:6060")
+	ProfilingMutexFraction = flag.Int("diagnostics.pprof.mutex-fraction", 1000, "With profiling enabled, sample one in N mutex contention events (0 disables)")
+	ProfilingBlockRate     = flag.Int("diagnostics.pprof.block-rate", 10000000, "With profiling enabled, sample one blocking event per N blocked nanoseconds (0 disables)")
 )
 
 // LoadMapping reads a YAML mapping configuration.
@@ -108,6 +118,40 @@ func main() {
 	}
 
 	slog.SetDefault(logger)
+
+	if *Diagnostics {
+		prometheus.Unregister(collectors.NewGoCollector())
+		prometheus.MustRegister(collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsAll)))
+		prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "goflow_diagnostics_enabled", Help: "One when sampled pipeline and full runtime diagnostics are enabled.",
+		}, func() float64 { return 1 }))
+		prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "goflow_diagnostics_build_info", Help: "Diagnostic binary version and build metadata.",
+			ConstLabels: prometheus.Labels{"version": version, "build": buildinfos},
+		}, func() float64 { return 1 }))
+	}
+	var profilingServer *http.Server
+	if *ProfilingAddr != "" {
+		var profilingErrors <-chan error
+		var err error
+		profilingServer, profilingErrors, err = profile.StartProfiling(*ProfilingAddr, *ProfilingMutexFraction, *ProfilingBlockRate)
+		if err != nil {
+			slog.Error("error starting diagnostics profiling", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		go func() {
+			if err := <-profilingErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("diagnostics profiling stopped", slog.String("error", err.Error()))
+			}
+		}()
+		slog.Info("diagnostics profiling enabled", slog.String("addr", profilingServer.Addr))
+		prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "goflow_diagnostics_mutex_profile_fraction", Help: "One in this many mutex contention events is profiled; zero disables.",
+		}, func() float64 { return float64(*ProfilingMutexFraction) }))
+		prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "goflow_diagnostics_block_profile_rate_nanoseconds", Help: "Target blocked nanoseconds per sampled block event; zero disables.",
+		}, func() float64 { return float64(*ProfilingBlockRate) }))
+	}
 
 	formatter, err := format.FindFormat(*Format)
 	if err != nil {
@@ -168,8 +212,10 @@ func main() {
 	wg := &sync.WaitGroup{}
 
 	var collecting bool
-	http.Handle("/metrics", promhttp.Handler())
-	http.HandleFunc("/__health", func(wr http.ResponseWriter, r *http.Request) {
+	// Never use DefaultServeMux here: net/http/pprof registers handlers there.
+	publicMux := http.NewServeMux()
+	publicMux.Handle("/metrics", promhttp.Handler())
+	publicMux.HandleFunc("/__health", func(wr http.ResponseWriter, r *http.Request) {
 		if !collecting {
 			wr.WriteHeader(http.StatusServiceUnavailable)
 			if _, err := wr.Write([]byte("Not OK\n")); err != nil {
@@ -185,6 +231,7 @@ func main() {
 	})
 	srv := http.Server{
 		Addr:              *Addr,
+		Handler:           publicMux,
 		ReadHeaderTimeout: time.Second * 5,
 	}
 	if *Addr != "" {
@@ -288,10 +335,16 @@ func main() {
 			Blocking:         isBlocking,
 			ReceiverCallback: metrics.NewReceiverMetric(),
 		}
+		if *Diagnostics {
+			cfg.Diagnostics = diagnostics.NewRecorder(listenAddrUrl.Scheme+"://"+listenAddrUrl.Host, *DiagnosticsSampleEvery, numWorkers)
+		}
 		recv, err := utils.NewUDPReceiver(cfg)
 		if err != nil {
 			logger.Error("error creating UDP receiver", slog.String("error", err.Error()))
 			os.Exit(1)
+		}
+		if cfg.Diagnostics != nil {
+			prometheus.MustRegister(cfg.Diagnostics)
 		}
 
 		cfgPipe := &utils.PipeConfig{
@@ -317,7 +370,7 @@ func main() {
 
 		// Add optional HTTP handler for templates
 		if nfP, ok := p.(*utils.NetFlowPipe); ok && *TemplatePath != "" {
-			http.HandleFunc(*TemplatePath, func(wr http.ResponseWriter, r *http.Request) {
+			publicMux.HandleFunc(*TemplatePath, func(wr http.ResponseWriter, r *http.Request) {
 				templates := nfP.GetTemplatesForAllSources()
 				if body, err := json.MarshalIndent(templates, "", "  "); err != nil {
 					slog.Error("error writing JSON body for /templates", slog.String("error", err.Error()))
@@ -460,6 +513,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("error shutting-down HTTP server", slog.String("error", err.Error()))
+	}
+	if err := profile.StopProfiling(ctx, profilingServer); err != nil {
+		logger.Error("error shutting down diagnostics profiling", slog.String("error", err.Error()))
 	}
 	cancel()
 	close(q) // close errors

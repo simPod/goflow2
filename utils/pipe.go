@@ -10,6 +10,7 @@ import (
 	"github.com/netsampler/goflow2/v2/decoders/netflowlegacy"
 	"github.com/netsampler/goflow2/v2/decoders/sflow"
 	"github.com/netsampler/goflow2/v2/decoders/utils"
+	"github.com/netsampler/goflow2/v2/diagnostics"
 	"github.com/netsampler/goflow2/v2/format"
 	"github.com/netsampler/goflow2/v2/producer"
 	"github.com/netsampler/goflow2/v2/transport"
@@ -39,15 +40,24 @@ type PipeConfig struct {
 	NetFlowTemplater templates.TemplateSystemGenerator
 }
 
-func (p *flowpipe) formatSend(flowMessageSet []producer.ProducerMessage) error {
+func (p *flowpipe) formatSend(flowMessageSet []producer.ProducerMessage, trace *diagnostics.Trace) error {
+	if trace != nil {
+		defer trace.SetStage(diagnostics.Pipeline)
+	}
 	for _, msg := range flowMessageSet {
 		// todo: pass normal
 		if p.format != nil {
+			if trace != nil {
+				trace.SetStage(diagnostics.Format)
+			}
 			key, data, err := p.format.Format(msg)
 			if err != nil {
 				return err
 			}
 			if p.transport != nil {
+				if trace != nil {
+					trace.SetStage(diagnostics.KafkaEnqueue)
+				}
 				if err = p.transport.Send(key, data); err != nil {
 					return err
 				}
@@ -115,6 +125,8 @@ func (p *SFlowPipe) DecodeFlow(msg interface{}) error {
 		return fmt.Errorf("flow is not *Message")
 	}
 	buf := bytes.NewBuffer(pkt.Payload)
+	pkt.Diagnostics.SetStage(diagnostics.Decode)
+	defer pkt.Diagnostics.EndPipeline()
 	//key := pkt.Src.String()
 
 	var packet sflow.Packet
@@ -123,8 +135,9 @@ func (p *SFlowPipe) DecodeFlow(msg interface{}) error {
 	}
 
 	args := producer.ProduceArgs{
-		Src: pkt.Src,
-		Dst: pkt.Dst,
+		Diagnostics: pkt.Diagnostics,
+		Src:         pkt.Src,
+		Dst:         pkt.Dst,
 
 		TimeReceived:   pkt.Received,
 		SamplerAddress: pkt.Src.Addr(),
@@ -132,12 +145,14 @@ func (p *SFlowPipe) DecodeFlow(msg interface{}) error {
 	if p.producer == nil {
 		return nil
 	}
+	pkt.Diagnostics.SetStage(diagnostics.Produce)
 	flowMessageSet, err := p.producer.Produce(&packet, &args)
+	pkt.Diagnostics.SetStage(diagnostics.Pipeline)
 	defer p.producer.Commit(flowMessageSet)
 	if err != nil {
 		return &PipeMessageError{pkt, err}
 	}
-	return p.formatSend(flowMessageSet)
+	return p.formatSend(flowMessageSet, pkt.Diagnostics)
 }
 
 // NewNetFlowPipe creates a flow pipe configured for NetFlow/IPFIX packets.
@@ -157,6 +172,8 @@ func (p *NetFlowPipe) DecodeFlow(msg interface{}) error {
 		return fmt.Errorf("flow is not *Message")
 	}
 	buf := bytes.NewBuffer(pkt.Payload)
+	pkt.Diagnostics.SetStage(diagnostics.Decode)
+	defer pkt.Diagnostics.EndPipeline()
 
 	key := pkt.Src.String()
 
@@ -203,8 +220,9 @@ func (p *NetFlowPipe) DecodeFlow(msg interface{}) error {
 	var err error
 
 	args := producer.ProduceArgs{
-		Src: pkt.Src,
-		Dst: pkt.Dst,
+		Diagnostics: pkt.Diagnostics,
+		Src:         pkt.Src,
+		Dst:         pkt.Dst,
 
 		TimeReceived:   pkt.Received,
 		SamplerAddress: pkt.Src.Addr(),
@@ -214,6 +232,7 @@ func (p *NetFlowPipe) DecodeFlow(msg interface{}) error {
 		return nil
 	}
 
+	pkt.Diagnostics.SetStage(diagnostics.Produce)
 	switch version {
 	case 5:
 		flowMessageSet, err = p.producer.Produce(&packetV5, &args)
@@ -223,11 +242,12 @@ func (p *NetFlowPipe) DecodeFlow(msg interface{}) error {
 		flowMessageSet, err = p.producer.Produce(&packetIPFIX, &args)
 	}
 	defer p.producer.Commit(flowMessageSet)
+	pkt.Diagnostics.SetStage(diagnostics.Pipeline)
 	if err != nil {
 		return &PipeMessageError{pkt, err}
 	}
 
-	return p.formatSend(flowMessageSet)
+	return p.formatSend(flowMessageSet, pkt.Diagnostics)
 }
 
 func (p *NetFlowPipe) Close() {
@@ -273,6 +293,8 @@ func (p *AutoFlowPipe) DecodeFlow(msg interface{}) error {
 		return fmt.Errorf("flow is not *Message")
 	}
 	buf := bytes.NewBuffer(pkt.Payload)
+	pkt.Diagnostics.SetStage(diagnostics.Decode)
+	defer pkt.Diagnostics.EndPipeline()
 
 	var proto uint32
 	if err := utils.BinaryDecoder(buf, &proto); err != nil {

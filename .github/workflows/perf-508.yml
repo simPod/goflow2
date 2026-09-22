@@ -18,7 +18,7 @@ jobs:
         run: |
           case "$GITHUB_REF_NAME" in
             perf/508-control-v222) go_version=1.23.6 ;;
-            perf/508-v222-go1255|perf/508-control-v226|perf/508-v226-old-protobuf-code|perf/508-v226-old-protobuf-runtime) go_version=1.25.5 ;;
+            perf/508-v222-go1255|perf/508-control-v226|perf/508-v226-old-protobuf-code|perf/508-v226-old-protobuf-runtime|perf/508-diagnostics) go_version=1.25.5 ;;
             *) exit 1 ;;
           esac
           echo "GO_VERSION=$go_version" >> "$GITHUB_ENV"
@@ -39,10 +39,13 @@ jobs:
         run: |
           test "$(go env GOVERSION)" = "go$GO_VERSION"
           go test ./...
+          CGO_ENABLED=1 go test -race ./diagnostics/... ./utils ./metrics ./transport/kafka
+          python3 -B -m unittest discover -s scripts -p 'test_capture_peak.py' -v
           mkdir -p dist
           binary="goflow2-508-${VARIANT}-linux-amd64"
           go build -ldflags "-X main.version=perf-508-${VARIANT}-${GITHUB_SHA:0:12} -X main.buildinfos=go${GO_VERSION}" -o "dist/$binary" cmd/goflow2/main.go
           "dist/$binary" -v
+          python3 -B scripts/smoke-diagnostics.py "dist/$binary"
           go version -m "dist/$binary" > dist/build-info.txt
           {
             echo "branch=$GITHUB_REF_NAME"
@@ -51,7 +54,8 @@ jobs:
             echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > dist/experiment.txt
           file "dist/$binary"
-          (cd dist && sha256sum "$binary" > SHA256SUMS)
+          cp scripts/capture-peak.py docs/diagnostics-508.md dist/
+          (cd dist && sha256sum "$binary" capture-peak.py diagnostics-508.md > SHA256SUMS)
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         with:

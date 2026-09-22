@@ -9,6 +9,7 @@ import (
 	"time"
 
 	reuseport "github.com/libp2p/go-reuseport"
+	"github.com/netsampler/goflow2/v2/diagnostics"
 )
 
 // ReceiverCallback is notified when packets are dropped.
@@ -29,10 +30,12 @@ type udpPacket struct {
 
 // Message carries a received UDP payload and metadata.
 type Message struct {
-	Src      netip.AddrPort
-	Dst      netip.AddrPort
-	Payload  []byte
-	Received time.Time
+	// Diagnostics is valid only for the duration of the decoder callback.
+	Diagnostics *diagnostics.Trace
+	Src         netip.AddrPort
+	Dst         netip.AddrPort
+	Payload     []byte
+	Received    time.Time
 }
 
 var packetPool = sync.Pool{
@@ -45,11 +48,12 @@ var packetPool = sync.Pool{
 
 // UDPReceiver receives UDP packets and dispatches them to decoders.
 type UDPReceiver struct {
-	ready    chan bool
-	q        chan bool
-	wg       *sync.WaitGroup
-	dispatch chan *udpPacket
-	errCh    chan error // linked to receiver, never closed
+	diagnostics *diagnostics.Recorder
+	ready       chan bool
+	q           chan bool
+	wg          *sync.WaitGroup
+	dispatch    chan *udpPacket
+	errCh       chan error // linked to receiver, never closed
 
 	decodersCnt int
 	blocking    bool
@@ -62,10 +66,12 @@ type UDPReceiver struct {
 
 // UDPReceiverConfig configures UDP receiver workers and sockets.
 type UDPReceiverConfig struct {
-	Workers   int
-	Sockets   int
-	Blocking  bool
-	QueueSize int
+	// Diagnostics enables receiver instrumentation; nil keeps it disabled.
+	Diagnostics *diagnostics.Recorder
+	Workers     int
+	Sockets     int
+	Blocking    bool
+	QueueSize   int
 
 	ReceiverCallback ReceiverCallback
 }
@@ -95,6 +101,7 @@ func NewUDPReceiver(cfg *UDPReceiverConfig) (*UDPReceiver, error) {
 		dispatchSize = cfg.QueueSize
 		r.blocking = cfg.Blocking
 		r.cb = cfg.ReceiverCallback
+		r.diagnostics = cfg.Diagnostics
 	}
 
 	if dispatchSize == 0 {
@@ -103,6 +110,7 @@ func NewUDPReceiver(cfg *UDPReceiverConfig) (*UDPReceiver, error) {
 		r.dispatch = make(chan *udpPacket, dispatchSize)
 	}
 
+	r.diagnostics.BindReceiver(r.workers, r.sockets, func() (int, int) { return len(r.dispatch), cap(r.dispatch) })
 	err := r.init()
 
 	return r, err
@@ -135,13 +143,14 @@ func (r *UDPReceiver) Errors() <-chan error {
 	return r.errCh
 }
 
-func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
+func (r *UDPReceiver) receive(addr string, port int, started chan bool, socket *diagnostics.Socket) error {
 	if strings.ContainsRune(addr, ':') && !strings.ContainsRune(addr, '[') {
 		addr = "[" + addr + "]"
 	}
 
 	pconn, err := reuseport.ListenPacket("udp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
+		socket.Error()
 		return err
 	}
 	close(started) // indicates receiver is setup
@@ -164,19 +173,21 @@ func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
 		return fmt.Errorf("not a udp connection")
 	}
 
-	return r.receiveRoutine(udpconn)
+	return r.receiveRoutine(udpconn, socket)
 }
 
-func (r *UDPReceiver) receiveRoutine(udpconn *net.UDPConn) (err error) {
+func (r *UDPReceiver) receiveRoutine(udpconn *net.UDPConn, socket *diagnostics.Socket) (err error) {
 	localAddr, _ := udpconn.LocalAddr().(*net.UDPAddr)
 
 	for {
 		pkt := packetPool.Get().(*udpPacket)
 		pkt.size, pkt.src, err = udpconn.ReadFromUDP(pkt.payload)
 		if err != nil {
+			socket.Error()
 			packetPool.Put(pkt)
 			return err
 		}
+		socket.Received(pkt.size)
 		pkt.dst = localAddr
 		pkt.received = time.Now().UTC()
 		if pkt.size == 0 {
@@ -248,7 +259,13 @@ func (r *UDPReceiver) decoders(workers int, decodeFunc DecoderFunc) error {
 						Received: pkt.received,
 					}
 
-					if err := decodeFunc(&msg); err != nil {
+					var err error
+					if r.diagnostics == nil {
+						err = decodeFunc(&msg)
+					} else {
+						err = r.decodeWithDiagnostics(i, &msg, decodeFunc)
+					}
+					if err != nil {
 						r.logError(&ReceiverError{err})
 					}
 				}
@@ -259,6 +276,17 @@ func (r *UDPReceiver) decoders(workers int, decodeFunc DecoderFunc) error {
 	}
 
 	return nil
+}
+
+func (r *UDPReceiver) decodeWithDiagnostics(worker int, msg *Message, decode DecoderFunc) (err error) {
+	trace := r.diagnostics.Begin(worker, msg.Received)
+	msg.Diagnostics = trace
+	completed := false
+	defer r.diagnostics.Idle(worker)
+	defer func() { trace.Finish(err, !completed); msg.Diagnostics = nil }()
+	err = decode(msg)
+	completed = true
+	return err
 }
 
 // receivers starts the UDP socket routines.
@@ -272,7 +300,7 @@ func (r *UDPReceiver) receivers(sockets int, addr string, port int) (rErr error)
 		started := make(chan bool) // indicates receiver setup is complete
 		go func() {
 			defer r.wg.Done()
-			if err := r.receive(addr, port, started); err != nil {
+			if err := r.receive(addr, port, started, r.diagnostics.Socket(i)); err != nil {
 				err = &ReceiverError{err}
 
 				select {

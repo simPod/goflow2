@@ -40,7 +40,10 @@ type KafkaDriver struct {
 	kafkaVersion          string
 	kafkaCompressionCodec string
 
-	producer sarama.AsyncProducer
+	producer                 sarama.AsyncProducer
+	kafkaDiagnostics         bool
+	kafkaDiagnosticSuccesses bool
+	diagnostics              *kafkaDiagnostics
 
 	q chan bool
 
@@ -92,6 +95,8 @@ var (
 )
 
 func (d *KafkaDriver) Prepare() error {
+	flag.BoolVar(&d.kafkaDiagnostics, "diagnostics.kafka", false, "Expose Kafka queue and existing Sarama metrics independently of global diagnostics")
+	flag.BoolVar(&d.kafkaDiagnosticSuccesses, "diagnostics.kafka.successes", false, "With diagnostics.kafka, drain and count successful producer completions (extra per-message overhead)")
 	flag.BoolVar(&d.kafkaTLS, "transport.kafka.tls", false, "Use TLS to connect to Kafka")
 
 	flag.StringVar(&d.kafkaClientCert, "transport.kafka.tls.client", "", "Kafka client certificate")
@@ -126,6 +131,9 @@ func (d *KafkaDriver) Errors() <-chan error {
 
 // Init configures the Kafka producer and establishes connections.
 func (d *KafkaDriver) Init() error {
+	if d.diagnostics != nil {
+		return errors.New("Kafka diagnostics producer is already initialized; close it before reinitializing")
+	}
 	kafkaConfigVersion, err := sarama.ParseKafkaVersion(d.kafkaVersion)
 	if err != nil {
 		return err
@@ -133,7 +141,7 @@ func (d *KafkaDriver) Init() error {
 
 	kafkaConfig := sarama.NewConfig()
 	kafkaConfig.Version = kafkaConfigVersion
-	kafkaConfig.Producer.Return.Successes = false
+	kafkaConfig.Producer.Return.Successes = d.kafkaDiagnostics && d.kafkaDiagnosticSuccesses
 	kafkaConfig.Producer.Return.Errors = true
 	kafkaConfig.Producer.MaxMessageBytes = d.kafkaMaxMsgBytes
 	kafkaConfig.Producer.Flush.Bytes = d.kafkaFlushBytes
@@ -267,6 +275,16 @@ func (d *KafkaDriver) Init() error {
 		return err
 	}
 	d.producer = kafkaProducer
+	if d.kafkaDiagnostics {
+		diag := newKafkaDiagnostics(kafkaConfig.MetricRegistry, kafkaProducer.Input(), d.kafkaDiagnosticSuccesses)
+		if err := diag.register(); err != nil {
+			_ = kafkaProducer.Close()
+			return err
+		}
+		d.diagnostics = diag
+		go diag.drain(kafkaProducer, d.errors)
+		return nil
+	}
 
 	d.q = make(chan bool)
 
@@ -307,6 +325,17 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 
 // Close stops the producer and releases resources.
 func (d *KafkaDriver) Close() error {
+	if diag := d.diagnostics; diag != nil {
+		diag.closing.Store(true)
+		d.producer.AsyncClose()
+		<-diag.done
+		diag.registerer.Unregister(diag)
+		d.diagnostics = nil
+		if len(diag.closeErrors) > 0 {
+			return diag.closeErrors
+		}
+		return nil
+	}
 	if err := d.producer.Close(); err != nil {
 		close(d.q)
 		return err
