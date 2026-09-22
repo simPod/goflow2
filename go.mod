@@ -49,3 +49,7 @@ require (
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
+
+// Diagnostic override for issue 508: isolate the old protobuf runtime without
+// downgrading Prometheus, which otherwise selects a newer protobuf version.
+replace google.golang.org/protobuf => google.golang.org/protobuf v1.36.5
