@@ -93,11 +93,41 @@ Capture behavior:
   optional `pidstat` alongside the profiles.
 - Record UTC start/end times and success/errors for each capture. Files remain
   local, private to the capture user; no environment or credentials are dumped.
-- Cap HTTP responses, command output, and bundle count. The absolute profile
-  ceiling alone is up to 24 GiB with the defaults; actual profiles are usually
-  much smaller. Check available disk space or lower `--profile-bytes` (bytes).
+- Retain at most **six bundles**: the initial baseline, the first queue/drop
+  capture, and the four newest other captures. Before the first congestion
+  capture, retain the baseline and five newest captures. Delete only older,
+  completed, unpinned bundles created by this script in this run directory.
+- Limit **all retained capture file contents to 2 GiB** and require at least
+  **5 GiB free** on the output filesystem before each write. The shared budget
+  includes profiles, metrics, system snapshots, metadata and `errors.log`, even
+  when capture threads write concurrently. Keep evidence already collected and
+  stop with a `STORAGE STOP` message and nonzero exit status if either guard trips.
+- Limit each profile response to **16 MiB** by default. Reject and remove an
+  incomplete response that exceeds this limit, while allowing other captures to
+  continue. Removed files and rotated bundles release their recorded byte budget.
 - Do not capture execution traces by default. `--trace-seconds 1` enables a short
   trace, which has higher overhead and should be used only if needed.
+
+The storage controls are enabled by default; no extra flags are needed:
+
+```text
+--keep-bundles 6
+--max-total-bytes 2147483648
+--min-free-bytes 5368709120
+--profile-bytes 16777216
+```
+
+Use a directory under `/home` on the reported collector filesystem (44 GiB free),
+not RAM-backed `/tmp` or the nearly capacity-limited root filesystem. The budget
+counts file contents, not filesystem block/metadata overhead. The free-space
+reserve adds headroom for that overhead, but other processes can consume disk
+space between a check and a write. An externally redirected `capture-peak.log`
+is outside the budget; messages are bounded and the script stops on a storage
+limit. A storage-interrupted bundle can be incomplete or lack final metadata.
+Retention protects already completed baseline and first-congestion evidence.
+
+`--max-bundles 24` still limits the **total number of captures made**, while
+`--keep-bundles 6` limits how many remain on disk. These are separate limits.
 
 Read `capture-peak.log` and the output directory's `errors.log` after the first
 baseline. Missing permissions or utilities are reported, not silently treated as

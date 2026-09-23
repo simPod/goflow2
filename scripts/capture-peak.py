@@ -2,6 +2,7 @@
 """Bounded, local GoFlow2 peak captures; Python 3 standard library only."""
 
 import argparse
+from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import ipaddress
@@ -13,6 +14,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -29,6 +31,159 @@ DROP = 'goflow2_flow_dropped_packets_total'
 
 def utc():
     return datetime.now(timezone.utc).isoformat()
+
+
+class StorageLimit(RuntimeError):
+    pass
+
+
+class StoredFile(AbstractContextManager):
+    def __init__(self, storage, path, output):
+        self.storage, self.path, self.output = storage, path, output
+
+    def write(self, data):
+        for offset in range(0, len(data), 65536):
+            chunk = memoryview(data)[offset:offset + 65536]
+            with self.storage.lock:
+                while chunk:
+                    self.storage.check(len(chunk))
+                    try:
+                        written = self.output.write(chunk)
+                        if not written:
+                            raise OSError('zero-length file write')
+                    except OSError as exc:
+                        self.storage.halt(str(exc))
+                    self.storage.sizes[self.path] += written
+                    self.storage.total += written
+                    chunk = chunk[written:]
+
+    def close(self):
+        with self.storage.lock:
+            self.output.close()
+            self.storage.live.discard(self.path)
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class Storage:
+    """Account retained file bytes, including open files; never recursively delete."""
+    def __init__(self, root, args, stop):
+        self.root, self.args, self.stop = root, args, stop
+        self.lock = threading.RLock()
+        self.total, self.failure = 0, None
+        self.sizes, self.identities = {}, {root: self.identity(root)}
+        self.live, self.completed, self.pinned = set(), set(), set()
+        self.bundles = []
+        with self.lock:
+            self.check()
+
+    @staticmethod
+    def identity(path):
+        info = path.lstat()
+        return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+    def halt(self, reason):
+        if self.failure is None:
+            self.failure = reason
+            self.stop.set()
+            print(utc() + ' STORAGE STOP: ' + reason, file=sys.stderr, flush=True)
+        raise StorageLimit(self.failure)
+
+    def check(self, size=0):
+        if self.failure:
+            raise StorageLimit(self.failure)
+        if self.total + size > self.args.max_total_bytes:
+            self.halt('retained file byte budget exceeded')
+        try:
+            free = shutil.disk_usage(self.root).free
+        except OSError as exc:
+            self.halt('disk usage unavailable: ' + str(exc))
+        if free - size < self.args.min_free_bytes:
+            self.halt('minimum free-space reserve would be breached')
+
+    def verify(self, path):
+        if path not in self.identities or self.identity(path) != self.identities[path]:
+            self.halt('refusing changed or unowned path: ' + str(path))
+        if path != self.root:
+            self.verify(path.parent)
+
+    def mkdir(self, path):
+        with self.lock:
+            self.check()
+            self.verify(path.parent)
+            path.mkdir(mode=0o700)
+            self.identities[path] = self.identity(path)
+
+    def open(self, path, append=False):
+        with self.lock:
+            self.check()
+            self.verify(path.parent)
+            exists = path in self.sizes
+            if exists:
+                if not append or path in self.live:
+                    raise ValueError('file already created or open: ' + str(path))
+                self.verify(path)
+            flags = os.O_WRONLY | os.O_NOFOLLOW | (os.O_APPEND if exists else os.O_CREAT | os.O_EXCL)
+            try:
+                output = os.fdopen(os.open(path, flags, 0o600), 'ab' if exists else 'wb', buffering=0)
+            except OSError as exc:
+                self.halt('cannot open output: ' + str(exc))
+            self.identities[path] = self.identity(path)
+            self.sizes.setdefault(path, 0)
+            self.live.add(path)
+            return StoredFile(self, path, output)
+
+    def save(self, path, data, append=False):
+        with self.open(path, append) as output:
+            output.write(data)
+
+    def remove(self, path):
+        with self.lock:
+            if path not in self.sizes:
+                return
+            self.verify(path)
+            if path in self.live:
+                self.halt('refusing to delete an open capture')
+            path.unlink()
+            self.total -= self.sizes.pop(path)
+            del self.identities[path]
+
+    def new_bundle(self, number, reason):
+        with self.lock:
+            self.check()
+            if len(self.bundles) >= self.args.keep_bundles:
+                victim = next((p for p in self.bundles if p in self.completed and p not in self.pinned), None)
+                if victim is None:
+                    self.halt('no completed unpinned bundle available for retention')
+                if victim.parent != self.root:
+                    self.halt('refusing retention outside direct run bundles')
+                self.verify(victim)
+                if any(victim in path.parents for path in self.live):
+                    self.halt('refusing retention of a bundle with open files')
+                directories = [p for p in self.identities if p not in self.sizes
+                               and (p == victim or victim in p.parents)]
+                # Reject foreign entries/symlinks before removing any evidence.
+                for directory in directories:
+                    self.verify(directory)
+                    for child in directory.iterdir():
+                        self.verify(child)
+                for path in list(self.sizes):
+                    if victim in path.parents:
+                        self.remove(path)
+                for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+                    directory.rmdir()
+                    del self.identities[directory]
+                self.bundles.remove(victim)
+                self.completed.remove(victim)
+            folder = self.root / f'{number:02d}-{reason}'
+            if folder.parent != self.root:
+                self.halt('bundle must be directly inside the run directory')
+            self.mkdir(folder)
+            if number == 1 or (reason in ('queue', 'drops') and len(self.pinned) < 2):
+                self.pinned.add(folder)
+            self.bundles.append(folder)
+            return folder
 
 
 def loopback_url(value):
@@ -48,17 +203,18 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('HTTP redirects are forbidden')
 
 
-def fetch(url, limit, destination=None, stop=None):
+def fetch(url, limit, destination=None, stop=None, storage=None):
     """Stream to a file, or return bounded bytes. Never use proxies or redirects."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     data = bytearray()
+    output = None
     deadline = time.monotonic() + 65
     try:
         with opener.open(url, timeout=40) as response:
             expected = int(response.headers.get('Content-Length', '-1'))
             if expected > limit:
                 raise ValueError('response exceeds byte limit')
-            output = destination.open('xb') if destination else None
+            output = (storage.open(destination) if storage else destination.open('xb')) if destination else None
             try:
                 size = 0
                 while True:
@@ -80,8 +236,11 @@ def fetch(url, limit, destination=None, stop=None):
                 if output:
                     output.close()
     except Exception:
-        if destination:
-            destination.unlink(missing_ok=True)
+        if destination and output is not None:
+            if storage:
+                storage.remove(destination)
+            else:
+                destination.unlink(missing_ok=True)
         raise
     return bytes(data)
 
@@ -151,11 +310,11 @@ class Trigger:
             self.last_baseline = now
 
 
-def command(argv, destination, stop, limit=16 * MIB):
+def command(argv, destination, stop, limit=16 * MIB, storage=None):
     """Bound subprocess time and output; no shell, environment dump, or cmdline."""
     if not shutil.which(argv[0]):
         raise FileNotFoundError(argv[0] + ' unavailable; capture skipped')
-    with destination.open('xb') as output, subprocess.Popen(
+    with (storage.open(destination) if storage else destination.open('xb')) as output, subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
         try:
             deadline, size = time.monotonic() + 40, 0
@@ -188,14 +347,19 @@ class Capture:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
         self.lock, self.errors = threading.Lock(), 0
         self.captures, self.metric_record = {}, None
+        self.storage = Storage(self.root, args, self.stop)
 
     def error(self, message):
         with self.lock:
+            if self.storage.failure:
+                return
             self.errors += 1
             line = utc() + ' ERROR: ' + message
+            try:
+                self.storage.save(self.root / 'errors.log', (line + '\n').encode(), append=True)
+            except StorageLimit:
+                return
             print(line, file=sys.stderr, flush=True)
-            with (self.root / 'errors.log').open('a') as output:
-                output.write(line + '\n')
 
     def attempt(self, label, function, *args):
         record = {'started_utc': utc(), 'status': 'stopped'}
@@ -206,7 +370,8 @@ class Capture:
                 return result
         except Exception as exc:
             record.update(status='stopped' if self.stop.is_set() else 'error', error=str(exc))
-            self.error(label + ': ' + str(exc))
+            if not self.storage.failure:
+                self.error(label + ': ' + str(exc))
         finally:
             record['finished_utc'] = utc()
             with self.lock:
@@ -229,32 +394,31 @@ class Capture:
                     data = source.read(16 * MIB + 1)
                 if len(data) > 16 * MIB:
                     raise ValueError('proc file exceeds byte limit')
-                (folder / name.lstrip('/').replace('/', '-')).write_bytes(data)
+                self.storage.save(folder / name.lstrip('/').replace('/', '-'), data)
             self.attempt(folder.name + ':' + name, copy)
         if self.args.thread_schedstats and self.args.pid:
             def threads():
-                with (folder / 'thread-schedstats.txt').open('x') as output:
+                with self.storage.open(folder / 'thread-schedstats.txt') as output:
                     with os.scandir(f'/proc/{self.args.pid}/task') as entries:
                         for index, entry in enumerate(entries):
                             if index >= 256:
                                 raise ValueError('thread schedstats capped at 256 threads')
                             def copy_thread():
                                 with open(entry.path + '/schedstat') as source:
-                                    output.write(entry.name + ' ' + source.read(4096) + '\n')
+                                    output.write((entry.name + ' ' + source.read(4096) + '\n').encode())
                             self.attempt(folder.name + ':thread ' + entry.name, copy_thread)
             self.attempt(folder.name + ':thread schedstats', threads)
 
     def snapshot(self, folder, phase):
         target = folder / phase
-        target.mkdir(mode=0o700)
+        self.storage.mkdir(target)
         self.proc(target)
         self.attempt('goroutine ' + phase, fetch,
                      self.args.pprof_url + '/goroutine?debug=2', self.args.profile_bytes,
-                     target / 'goroutine-debug2.txt', self.stop)
+                     target / 'goroutine-debug2.txt', self.stop, self.storage)
 
     def bundle(self, number, reason, raw, sample):
-        folder = self.root / f'{number:02d}-{reason}'
-        folder.mkdir(mode=0o700)
+        folder = self.storage.new_bundle(number, reason)
         started, errors = time.time(), self.errors
         self.captures = {'metrics before': self.metric_record} if self.metric_record else {}
         meta = {'started_utc': utc(), 'reason': reason, 'pid': self.args.pid,
@@ -262,7 +426,7 @@ class Capture:
                 'queue_ratio': sample['queue_ratio'], 'process_start_time': sample['process_start_time'],
                 'process_uptime_seconds': started - sample['process_start_time']
                 if sample['process_start_time'] is not None else None}
-        (folder / 'metrics-before.txt').write_bytes(raw)
+        self.storage.save(folder / 'metrics-before.txt', raw)
         self.snapshot(folder, 'before')
         profiles = [('cpu', 'profile?seconds=30'), ('mutex', 'mutex?seconds=30'),
                     ('block', 'block?seconds=30'), ('allocs', 'allocs?seconds=30')]
@@ -272,18 +436,18 @@ class Capture:
         # Six auxiliary slots: trace, heap, goroutine, two ss calls, and pidstat.
         with ThreadPoolExecutor(max_workers=self.args.workers) as pool, ThreadPoolExecutor(max_workers=6) as aux:
             futures = [aux.submit(self.attempt, name, fetch, self.args.pprof_url + '/' + endpoint,
-                                   self.args.profile_bytes, folder / (name + ('.out' if name == 'trace' else '.pb')), self.stop)
+                                   self.args.profile_bytes, folder / (name + ('.out' if name == 'trace' else '.pb')), self.stop, self.storage)
                        for name, endpoint in immediate]
             for protocol in ('u', 't'):
                 futures.append(aux.submit(self.attempt, 'ss ' + protocol, command,
                                           ['ss', '-' + protocol, '-a', '-n', '-m', '-p'],
-                                          folder / ('ss-' + protocol + '.txt'), self.stop))
+                                          folder / ('ss-' + protocol + '.txt'), self.stop, 16 * MIB, self.storage))
             if self.args.pid:
                 futures.append(aux.submit(self.attempt, 'pidstat', command,
                                           ['pidstat', '-u', '-w', '-t', '-p', str(self.args.pid), '1', '30'],
-                                          folder / 'pidstat.txt', self.stop))
+                                          folder / 'pidstat.txt', self.stop, 16 * MIB, self.storage))
             futures += [pool.submit(self.attempt, name, fetch, self.args.pprof_url + '/' + endpoint,
-                                    self.args.profile_bytes, folder / (name + '.pb'), self.stop)
+                                    self.args.profile_bytes, folder / (name + '.pb'), self.stop, self.storage)
                         for name, endpoint in profiles]
             for future in futures:
                 future.result()
@@ -292,16 +456,23 @@ class Capture:
                                  self.args.metric_bytes, None, self.stop)
         after = None
         if after_raw is not None:
-            (folder / 'metrics-after.txt').write_bytes(after_raw)
+            self.storage.save(folder / 'metrics-after.txt', after_raw)
             after = self.attempt('parse metrics after', metrics, after_raw, self.args.listener)
         if after:
             meta['process_start_time_after'] = after['process_start_time']
         meta.update(finished_utc=utc(), elapsed_seconds=time.time() - started,
                     errors=self.errors - errors, interrupted=self.stop.is_set(), captures=self.captures)
-        (folder / 'metadata.json').write_text(json.dumps(meta, indent=2) + '\n')
+        self.storage.save(folder / 'metadata.json', (json.dumps(meta, indent=2) + '\n').encode())
+        self.storage.completed.add(folder)
         return after if after else sample
 
     def run(self):
+        try:
+            return self._run()
+        except StorageLimit:
+            return 1
+
+    def _run(self):
         deadline = time.monotonic() + self.args.duration
         trigger = Trigger(self.args)
         try:
@@ -331,11 +502,13 @@ class Capture:
                     failures += 1
                     self.error(f'METRICS FAILURE #{failures}; capture blind: {exc}')
         print(f'{utc()} finished: {trigger.count} bundles, {self.errors} errors; {self.root}', flush=True)
-        return 1 if self.errors else 0
+        return 1 if self.errors or self.storage.failure else 0
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'Storage limits cover retained file bytes in this unique run directory, not redirected stdout/stderr. '
+        'Messages are bounded and capture stops on a storage limit. PID remains fixed after process restart.'))
     parser.add_argument('--output', default='peak-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
     parser.add_argument('--metrics-url', type=loopback_url, default='http://127.0.0.1:8081/metrics')
     parser.add_argument('--pprof-url', type=loopback_url, default='http://127.0.0.1:6060/debug/pprof')
@@ -343,15 +516,21 @@ def arguments(argv=None):
     parser.add_argument('--pid', type=int, help='fixed GoFlow2 PID for /proc and pidstat; restart capture with new PID after restart')
     parser.add_argument('--thread-schedstats', action='store_true', help='read at most 256 thread schedstats; requires --pid')
     for name, default in [('duration', 86400), ('poll-interval', 10), ('cooldown', 900),
-                          ('baseline-interval', 3600), ('max-bundles', 24), ('workers', 4),
-                          ('profile-bytes', 128 * MIB), ('metric-bytes', 16 * MIB)]:
+                          ('baseline-interval', 3600), ('workers', 4),
+                          ('profile-bytes', 16 * MIB), ('metric-bytes', 16 * MIB)]:
         parser.add_argument('--' + name, type=int, default=default,
                             help=f'default {default}; time values are seconds')
     parser.add_argument('--trace-seconds', type=int, default=0, help='expensive: 0 disables, or 1–5 seconds')
+    parser.add_argument('--max-bundles', type=int, default=24, help='total capture cap (default 24), independent of retention')
+    parser.add_argument('--keep-bundles', type=int, default=6, help='retain initial baseline, first queue/drops bundle, and newest others (default 6, minimum 3)')
+    parser.add_argument('--max-total-bytes', type=int, default=2147483648, help='retained output byte budget (default 2GiB)')
+    parser.add_argument('--min-free-bytes', type=int, default=5368709120, help='free-space reserve checked before each write (default 5GiB)')
     args = parser.parse_args(argv)
     if any(getattr(args, key) <= 0 for key in ('duration', 'poll_interval', 'cooldown', 'baseline_interval',
-                                             'max_bundles', 'workers', 'profile_bytes', 'metric_bytes')):
+                                             'max_bundles', 'workers', 'profile_bytes', 'metric_bytes', 'max_total_bytes')):
         parser.error('limits and intervals must be positive')
+    if args.keep_bundles < 3 or args.min_free_bytes < 0:
+        parser.error('--keep-bundles must be at least 3; --min-free-bytes must be nonnegative')
     if (args.max_bundles > 24 or args.workers > 8 or args.profile_bytes > 128 * MIB
             or args.metric_bytes > 16 * MIB or not 0 <= args.trace_seconds <= 5):
         parser.error('maximums: 24 bundles, 8 workers, 128MiB/profile, 16MiB/metrics, 5s trace')
@@ -369,6 +548,8 @@ def main():
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: capture.stop.set())
         return capture.run()
+    except StorageLimit:
+        return 1
     except Exception as exc:
         if capture:
             try:

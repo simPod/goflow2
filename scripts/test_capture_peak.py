@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -12,6 +13,7 @@ import time
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 
 spec = importlib.util.spec_from_file_location('capture_peak', Path(__file__).with_name('capture-peak.py'))
@@ -69,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
 
 class CaptureTest(unittest.TestCase):
     def setUp(self):
+        usage = mock.patch.object(peak.shutil, 'disk_usage', return_value=SimpleNamespace(free=100 * 1024 ** 3))
+        self.disk_usage = usage.start()
+        self.addCleanup(usage.stop)
         self.umask = os.umask(0o077)
         self.tmp = tempfile.TemporaryDirectory()
         self.server = MockServer()
@@ -198,6 +203,8 @@ class CaptureTest(unittest.TestCase):
             self.assertGreaterEqual(end, start)
         for path in [capture.root, *capture.root.rglob('*')]:
             self.assertEqual(path.stat().st_mode & 0o777, 0o700 if path.is_dir() else 0o600)
+        self.assertEqual(capture.storage.total, sum(p.stat().st_size for p in capture.root.rglob('*') if p.is_file()))
+        self.assertIn(folder, capture.storage.completed)
 
     def test_explicit_trace(self):
         self.args.trace_seconds = 3
@@ -230,7 +237,7 @@ class CaptureTest(unittest.TestCase):
             if name:
                 enter(name)
 
-        def run_command(argv, destination, stop):
+        def run_command(argv, destination, stop, limit, storage):
             if argv[0] == 'pidstat':
                 self.assertEqual(argv, ['pidstat', '-u', '-w', '-t', '-p', '12345', '1', '30'])
                 enter('pidstat')
@@ -368,6 +375,285 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual(capture.run(), 1)
         self.assertIn('METRICS FAILURE #3; capture blind', (capture.root / 'errors.log').read_text())
 
+    def test_low_free_space_fails_before_http_or_capture(self):
+        self.disk_usage.return_value.free = self.args.min_free_bytes - 1
+        with mock.patch.object(peak, 'arguments', return_value=self.args), redirect_stderr(self.quiet):
+            self.assertEqual(peak.main(), 1)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(list(Path(self.args.output).iterdir()), [])
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+        self.assertNotIn('FATAL', self.quiet.getvalue())
+
+    def test_metrics_snapshot_obeys_total_budget(self):
+        self.args.max_total_bytes = 1
+        capture, result = self.run_capture()
+        self.assertEqual(result, 1)
+        self.assertTrue(capture.stop.is_set())
+        self.assertEqual(capture.storage.total, 0)
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+        self.assertEqual(self.server.requests, ['/metrics', '/debug/pprof/'])
+
+    def test_metadata_cannot_bypass_budget_or_hide_storage_stop(self):
+        self.args.max_total_bytes = 2 * len(exposition()) + 8 * len(b'profile bytes') + 50
+        capture, result = self.run_capture()
+        self.assertEqual(result, 1)
+        self.assertTrue(capture.stop.is_set())
+        self.assertTrue((capture.root / '01-baseline/cpu.pb').exists())
+        self.assertTrue((capture.root / '01-baseline/metrics-after.txt').exists())
+        self.assertLessEqual(capture.storage.total, self.args.max_total_bytes)
+        self.assertEqual(capture.storage.total, sum(p.stat().st_size for p in capture.root.rglob('*') if p.is_file()))
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+        self.assertNotIn('ERROR:', self.quiet.getvalue())
+        self.assertNotIn(capture.root / '01-baseline', capture.storage.completed)
+
+    def test_partial_http_files_are_removed_and_refunded(self):
+        self.server.responses['/large'] = (200, b'x' * 200000, {})
+        for budget, response_limit, stopped in ((70000, 300000, True), (1000000, 70000, False)):
+            with self.subTest(budget=budget):
+                self.args.output = self.tmp.name + '/' + str(budget)
+                self.args.max_total_bytes = budget
+                capture = peak.Capture(self.args)
+                destination = capture.root / 'partial.pb'
+                with redirect_stderr(self.quiet), self.assertRaises((peak.StorageLimit, ValueError)):
+                    peak.fetch(self.url + '/large', response_limit, destination, capture.stop, capture.storage)
+                self.assertFalse(destination.exists())
+                self.assertEqual(capture.storage.total, 0)
+                self.assertEqual(capture.storage.live, set())
+                self.assertEqual(capture.stop.is_set(), stopped)
+
+    def test_concurrent_http_profiles_share_one_budget(self):
+        self.args.max_total_bytes = 500
+        capture = peak.Capture(self.args)
+        barrier = threading.Barrier(4)
+        self.server.responses['/profile'] = (200, b'x' * 300, {})
+        self.server.on_request = lambda path: barrier.wait(timeout=5)
+        observed = []
+
+        def usage(root):
+            observed.append(capture.storage.total)
+            return SimpleNamespace(free=100 * 1024 ** 3)
+
+        self.disk_usage.side_effect = usage
+
+        def download(number):
+            try:
+                peak.fetch(self.url + '/profile', 1000, capture.root / f'{number}.pb',
+                           capture.stop, capture.storage)
+            except (peak.StorageLimit, TimeoutError):
+                pass
+
+        with redirect_stderr(self.quiet), ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(download, range(4)))
+        self.assertTrue(capture.stop.is_set())
+        self.assertLessEqual(max(observed), 500)
+        self.assertLessEqual(capture.storage.total, 500)
+        self.assertEqual(capture.storage.total, sum(p.stat().st_size for p in capture.root.iterdir()))
+        self.assertEqual(capture.storage.live, set())
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+
+
+class StorageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        usage = mock.patch.object(peak.shutil, 'disk_usage', return_value=SimpleNamespace(free=100 * 1024 ** 3))
+        self.disk_usage = usage.start()
+        self.addCleanup(usage.stop)
+        self.args = peak.arguments(['--output', self.tmp.name + '/run'])
+        self.capture = peak.Capture(self.args)
+        self.storage = self.capture.storage
+        self.quiet = io.StringIO()
+
+    def disk_bytes(self):
+        return sum(p.stat().st_size for p in self.capture.root.rglob('*') if p.is_file())
+
+    def test_concurrent_writers_cannot_overshoot_budget_and_wake_waiters(self):
+        self.args.max_total_bytes = 1000
+        barrier = threading.Barrier(4)
+        outputs = [self.storage.open(self.capture.root / f'{i}.pb') for i in range(4)]
+
+        def write(output):
+            with output:
+                barrier.wait(timeout=5)
+                try:
+                    for _ in range(20):
+                        output.write(b'x' * 100)
+                except peak.StorageLimit:
+                    pass
+
+        with redirect_stderr(self.quiet), ThreadPoolExecutor(max_workers=5) as pool:
+            waiter = pool.submit(self.capture.stop.wait, 5)
+            list(pool.map(write, outputs))
+            self.assertTrue(waiter.result())
+        self.assertEqual(self.storage.total, 1000)
+        self.assertEqual(self.disk_bytes(), 1000)
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+        self.assertEqual(self.storage.live, set())
+
+    def test_free_space_checked_under_lock_for_each_chunk(self):
+        self.args.min_free_bytes = 200
+        self.disk_usage.side_effect = lambda root: SimpleNamespace(free=1200 - self.storage.total)
+        with redirect_stderr(self.quiet), self.storage.open(self.capture.root / 'sample') as output:
+            for _ in range(10):
+                output.write(b'x' * 100)
+            with self.assertRaises(peak.StorageLimit):
+                output.write(b'x')
+        self.assertEqual(self.disk_bytes(), 1000)
+        self.assertGreaterEqual(self.disk_usage.call_count, 12)
+        self.assertTrue(self.capture.stop.is_set())
+
+    def test_runtime_free_space_decline_stops_future_output(self):
+        path = self.capture.root / 'useful.txt'
+        with self.storage.open(path) as output:
+            output.write(b'keep this')
+            self.disk_usage.return_value.free = self.args.min_free_bytes - 1
+            with redirect_stderr(self.quiet), self.assertRaises(peak.StorageLimit):
+                output.write(b'no')
+        with redirect_stderr(self.quiet):
+            self.capture.error('must not write errors.log')
+        self.assertEqual(path.read_bytes(), b'keep this')
+        self.assertFalse((self.capture.root / 'errors.log').exists())
+        self.assertEqual(self.storage.total, len(b'keep this'))
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+
+    def test_actual_write_failure_stops_without_losing_previous_bytes(self):
+        path = self.capture.root / 'sample'
+        with self.storage.open(path) as output:
+            output.write(b'useful')
+            with mock.patch.object(output.output, 'write', side_effect=OSError('No space left on device')), \
+                    redirect_stderr(self.quiet), self.assertRaises(peak.StorageLimit):
+                output.write(b'failed')
+        self.assertEqual(path.read_bytes(), b'useful')
+        self.assertEqual(self.storage.total, len(b'useful'))
+        self.assertTrue(self.capture.stop.is_set())
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+
+    def test_errors_log_obeys_budget_and_is_silent_after_limit(self):
+        self.args.max_total_bytes = 100
+        with redirect_stderr(self.quiet):
+            self.capture.error('first')
+            self.capture.error('x' * 200)
+            after_stop = self.quiet.getvalue()
+            for _ in range(20):
+                self.capture.error('retry')
+        self.assertEqual(self.quiet.getvalue(), after_stop)
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+        self.assertIn('first', (self.capture.root / 'errors.log').read_text())
+        self.assertNotIn('retry', (self.capture.root / 'errors.log').read_text())
+        self.assertEqual(self.storage.total, self.disk_bytes())
+        self.assertLessEqual(self.disk_bytes(), 100)
+
+    def test_proc_reads_use_shared_budget(self):
+        self.args.max_total_bytes = 100
+        folder = self.storage.new_bundle(1, 'baseline')
+        with mock.patch('builtins.open', side_effect=lambda *a, **kw: io.BytesIO(b'x' * 80)), \
+                redirect_stderr(self.quiet):
+            self.capture.proc(folder)
+        self.assertEqual(self.disk_bytes(), 80)
+        self.assertEqual(self.storage.total, 80)
+        self.assertTrue(self.capture.stop.is_set())
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+
+    def test_thread_schedstats_use_shared_budget(self):
+        self.args.pid, self.args.thread_schedstats = 123, True
+        self.args.max_total_bytes = 5
+        folder = self.storage.new_bundle(1, 'baseline')
+        entries = mock.MagicMock()
+        entries.__enter__.return_value = [SimpleNamespace(path='/proc/123/task/123', name='123')]
+
+        def source(path, *args):
+            return io.StringIO('1 2 3') if '/task/' in path else io.BytesIO(b'')
+
+        with mock.patch('builtins.open', side_effect=source), mock.patch.object(peak.os, 'scandir', return_value=entries), \
+                redirect_stderr(self.quiet):
+            self.capture.proc(folder)
+        self.assertTrue(self.capture.stop.is_set())
+        self.assertEqual(self.storage.total, 0)
+        self.assertEqual(self.quiet.getvalue().count('STORAGE STOP:'), 1)
+
+    def test_subprocess_output_uses_shared_budget(self):
+        self.args.max_total_bytes = 10
+        destination = self.capture.root / 'command.txt'
+        with redirect_stderr(self.quiet), self.assertRaises(peak.StorageLimit):
+            peak.command([sys.executable, '-c', 'print("x" * 100)'], destination,
+                         self.capture.stop, storage=self.storage)
+        self.assertTrue(self.capture.stop.is_set())
+        self.assertLessEqual(destination.stat().st_size, 10)
+        self.assertEqual(self.storage.total, self.disk_bytes())
+        self.assertEqual(self.storage.live, set())
+
+    def fill_bundle(self, number, reason):
+        folder = self.storage.new_bundle(number, reason)
+        child = folder / 'before'
+        self.storage.mkdir(child)
+        self.storage.save(child / 'data.txt', str(number).encode() * number)
+        self.storage.completed.add(folder)
+        return folder
+
+    def test_retention_pins_first_baseline_and_first_peak_and_refunds_bytes(self):
+        outside = Path(self.tmp.name) / 'unrelated'
+        outside.write_bytes(b'leave alone')
+        foreign = self.capture.root / 'unrelated'
+        foreign.mkdir()
+        (foreign / 'data').write_bytes(b'leave alone')
+        created = []
+        for number in range(1, 11):
+            reason = 'baseline' if number == 1 else ('queue' if number in (3, 6) else 'periodic-baseline')
+            created.append(self.fill_bundle(number, reason))
+            self.assertLessEqual(len(self.storage.bundles), 6)
+            expected_bytes = sum(p.stat().st_size for folder in self.storage.bundles
+                                 for p in folder.rglob('*') if p.is_file())
+            self.assertEqual(self.storage.total, expected_bytes)
+        self.assertEqual(self.storage.bundles, [created[i - 1] for i in (1, 3, 7, 8, 9, 10)])
+        self.assertEqual(self.storage.pinned, {created[0], created[2]})
+        self.assertFalse(created[1].exists())
+        self.assertEqual(outside.read_bytes(), b'leave alone')
+        self.assertEqual((foreign / 'data').read_bytes(), b'leave alone')
+
+    def test_no_peak_retains_baseline_and_five_recent_bundles(self):
+        created = [self.fill_bundle(i, 'baseline' if i == 1 else 'periodic-baseline') for i in range(1, 10)]
+        self.assertEqual(self.storage.bundles, [created[0], *created[4:]])
+        self.assertEqual(self.storage.total, self.disk_bytes())
+        self.assertEqual(self.storage.pinned, {created[0]})
+
+    def test_retention_never_deletes_incomplete_or_open_bundles(self):
+        self.args.keep_bundles = 3
+        baseline = self.fill_bundle(1, 'baseline')
+        active = self.storage.new_bundle(2, 'periodic-baseline')
+        completed = self.fill_bundle(3, 'periodic-baseline')
+        with self.storage.open(active / 'in-flight.pb') as output:
+            output.write(b'useful')
+            new = self.storage.new_bundle(4, 'queue')
+            self.assertEqual(self.storage.bundles, [baseline, active, new])
+            self.assertFalse(completed.exists())
+            self.assertEqual((active / 'in-flight.pb').read_bytes(), b'useful')
+        self.assertEqual(self.storage.total, self.disk_bytes())
+
+    def test_retention_rejects_unowned_file_without_deleting_evidence(self):
+        self.args.keep_bundles = 3
+        self.fill_bundle(1, 'baseline')
+        victim = self.fill_bundle(2, 'periodic-baseline')
+        self.fill_bundle(3, 'drops')
+        foreign = victim / 'foreign'
+        foreign.write_bytes(b'not ours')
+        with redirect_stderr(self.quiet), self.assertRaises(peak.StorageLimit):
+            self.storage.new_bundle(4, 'periodic-baseline')
+        self.assertEqual(foreign.read_bytes(), b'not ours')
+        self.assertTrue((victim / 'before/data.txt').exists())
+
+    def test_retention_rejects_replaced_bundle_symlink(self):
+        self.args.keep_bundles = 3
+        self.fill_bundle(1, 'baseline')
+        victim = self.fill_bundle(2, 'periodic-baseline')
+        self.fill_bundle(3, 'drops')
+        moved = Path(self.tmp.name) / 'moved'
+        victim.rename(moved)
+        victim.symlink_to(moved, target_is_directory=True)
+        with redirect_stderr(self.quiet), self.assertRaises(peak.StorageLimit):
+            self.storage.new_bundle(4, 'periodic-baseline')
+        self.assertEqual((moved / 'before/data.txt').read_bytes(), b'22')
+        self.assertTrue(victim.is_symlink())
+
 
 class ArgumentsTest(unittest.TestCase):
     def test_literal_loopback_only(self):
@@ -383,9 +669,13 @@ class ArgumentsTest(unittest.TestCase):
         args = peak.arguments([])
         self.assertEqual((args.duration, args.cooldown, args.baseline_interval, args.max_bundles,
                           args.trace_seconds), (86400, 900, 3600, 24, 0))
+        self.assertEqual((args.max_total_bytes, args.min_free_bytes, args.keep_bundles, args.profile_bytes),
+                         (2147483648, 5368709120, 6, 16 * peak.MIB))
         for argv in (['--trace-seconds', '-1'], ['--trace-seconds', '6'], ['--trace-seconds', '0.5'],
                      ['--max-bundles', '25'], ['--max-bundles', '0'], ['--workers', '9'],
                      ['--duration', '0'], ['--pid', '0'], ['--thread-schedstats'],
+                     ['--keep-bundles', '2'], ['--keep-bundles', '-1'], ['--max-total-bytes', '0'],
+                     ['--min-free-bytes', '-1'],
                      ['--profile-bytes', str(128 * peak.MIB + 1)],
                      ['--metric-bytes', str(16 * peak.MIB + 1)]):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
