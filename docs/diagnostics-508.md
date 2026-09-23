@@ -1,5 +1,8 @@
 # GoFlow2 peak diagnostics — issue 508
 
+Investigation history, measured findings, profile evidence and next experiments:
+[performance-investigation-508.md](https://github.com/simpod/goflow2/blob/perf/508-diagnostics/docs/performance-investigation-508.md).
+
 This experimental build is based on **v2.2.6**, pinned to **Go 1.25.5**, Linux
 amd64, `GOAMD64=v1`, and `CGO_ENABLED=0`. Dependencies are unchanged. It measures
 the existing pipeline; it does not tune queues, worker counts, compression,
