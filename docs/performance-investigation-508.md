@@ -401,6 +401,8 @@ Controlled comparison:
 - Success means higher sustained completed throughput and lower queue/drop rates, not merely lower CPU or a temporarily empty queue after restart.
 - Receiver capacity is unchanged, but total internal Kafka buffering increases; allow the system to reach steady state before drawing a conclusion.
 
+CI for the producer-pool branch caught a pre-existing UDP shutdown/restart data race between `UDPReceiver.init()` replacing `r.q` and the socket watcher reading it. It was reproduced locally with a rapid-restart race test and corrected by capturing the session stop channel before starting the watcher. Steady-state processing and receive-queue policy are unchanged. This lifecycle fix is not claimed to explain the observed peak throughput limit.
+
 Alternatives discussed but not selected as the first targeted experiment:
 
 - Multiple independent collector processes sharing UDP 9801 via SO_REUSEPORT. This separates all shared resources, but hash-based receive distribution can be uneven and complicates comparison.

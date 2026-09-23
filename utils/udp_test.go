@@ -57,6 +57,24 @@ func TestUDPClose(t *testing.T) {
 	require.Error(t, r.Stop())
 }
 
+// The socket-close watcher may still be scheduled as Stop resets receiver state.
+// Exercise traffic-driven exits as well as exits caused by closing the socket.
+func TestUDPReceiverRapidRestart(t *testing.T) {
+	port, err := getFreeUDPPort()
+	require.NoError(t, err)
+	r, err := NewUDPReceiver(&UDPReceiverConfig{Workers: 2, Sockets: 2, QueueSize: 32})
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		require.NoError(t, r.Start("127.0.0.1", port, nil))
+		conn, err := net.Dial("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		require.NoError(t, err)
+		_, err = conn.Write([]byte("restart"))
+		require.NoError(t, conn.Close())
+		require.NoError(t, err)
+		require.NoError(t, r.Stop())
+	}
+}
+
 func getFreeUDPPort() (int, error) {
 	a, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	if err != nil {

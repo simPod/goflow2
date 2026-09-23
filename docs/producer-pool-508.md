@@ -51,6 +51,12 @@ initialize, already created members are shut down and the collector fails startu
 rather than silently using fewer producers. Shutdown initiates flushing on all
 members before waiting for completion and returns collected shutdown errors.
 
+The build also fixes a pre-existing UDP shutdown/restart race caught by CI:
+the socket-close watcher now retains its session's stop channel instead of
+reading a receiver field that `Stop` can replace. A rapid restart regression
+test reproduces the race before the fix. This does not change packet processing
+or queue behavior during steady-state collection.
+
 ## Confirm the deployment
 
 After restarting GoFlow, check the existing `/metrics` endpoint for:

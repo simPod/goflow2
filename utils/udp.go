@@ -156,11 +156,14 @@ func (r *UDPReceiver) receive(addr string, port int, started chan bool, socket *
 	close(started) // indicates receiver is setup
 
 	q := make(chan bool)
+	// Stop can reset r.q after this receive routine exits while the socket
+	// watcher is still being scheduled. Keep the channel for this session.
+	stop := r.q
 	// function to quit
 	go func() {
 		select {
 		case <-q: // if routine has exited before
-		case <-r.q: // upon general close
+		case <-stop: // upon general close
 		}
 		if err := pconn.Close(); err != nil {
 			r.logError(err)
