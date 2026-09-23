@@ -299,7 +299,7 @@ class Trigger:
             return None
         if now - self.last_baseline >= self.args.baseline_interval:
             return 'periodic-baseline'
-        if sample['queue_ratio'] >= .75:
+        if sample['queue_ratio'] >= self.args.queue_threshold:
             return 'queue'
         return 'drops' if increase > 0 else None
 
@@ -423,7 +423,8 @@ class Capture:
         self.captures = {'metrics before': self.metric_record} if self.metric_record else {}
         meta = {'started_utc': utc(), 'reason': reason, 'pid': self.args.pid,
                 'pid_policy': 'fixed; restart capture with the new --pid after a process restart',
-                'queue_ratio': sample['queue_ratio'], 'process_start_time': sample['process_start_time'],
+                'queue_ratio': sample['queue_ratio'], 'queue_threshold': self.args.queue_threshold,
+                'process_start_time': sample['process_start_time'],
                 'process_uptime_seconds': started - sample['process_start_time']
                 if sample['process_start_time'] is not None else None}
         self.storage.save(folder / 'metrics-before.txt', raw)
@@ -521,11 +522,15 @@ def arguments(argv=None):
         parser.add_argument('--' + name, type=int, default=default,
                             help=f'default {default}; time values are seconds')
     parser.add_argument('--trace-seconds', type=int, default=0, help='expensive: 0 disables, or 1–5 seconds')
+    parser.add_argument('--queue-threshold', type=float, default=.90,
+                        help='queue occupancy fraction triggering profiles (default 0.90); drops also trigger')
     parser.add_argument('--max-bundles', type=int, default=24, help='total capture cap (default 24), independent of retention')
     parser.add_argument('--keep-bundles', type=int, default=6, help='retain initial baseline, first queue/drops bundle, and newest others (default 6, minimum 3)')
     parser.add_argument('--max-total-bytes', type=int, default=2147483648, help='retained output byte budget (default 2GiB)')
     parser.add_argument('--min-free-bytes', type=int, default=5368709120, help='free-space reserve checked before each write (default 5GiB)')
     args = parser.parse_args(argv)
+    if not math.isfinite(args.queue_threshold) or not 0 < args.queue_threshold <= 1:
+        parser.error('--queue-threshold must be a finite fraction greater than 0 and at most 1')
     if any(getattr(args, key) <= 0 for key in ('duration', 'poll_interval', 'cooldown', 'baseline_interval',
                                              'max_bundles', 'workers', 'profile_bytes', 'metric_bytes', 'max_total_bytes')):
         parser.error('limits and intervals must be positive')

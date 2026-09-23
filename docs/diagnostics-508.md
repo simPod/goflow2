@@ -85,7 +85,7 @@ Capture behavior:
 
 - Validate diagnostics and local pprof access at startup; fail visibly if absent.
 - Capture an initial baseline and periodic baselines (hourly by default).
-- Poll every 10 seconds; trigger at queue occupancy >=75% or increasing drop
+- Poll every 10 seconds; trigger at queue occupancy >=90% or increasing drop
   counters, with a default 15-minute cooldown between bundles.
 - Capture 30-second CPU, mutex, block, and allocation delta profiles concurrently.
 - Capture heap without forcing GC, binary goroutine profiles, before/after full
@@ -116,6 +116,12 @@ The storage controls are enabled by default; no extra flags are needed:
 --min-free-bytes 5368709120
 --profile-bytes 16777216
 ```
+
+The profile trigger is configurable with `--queue-threshold 0.90` (the default).
+For the one-million-datagram queue, this means 900,000 queued datagrams. It is
+independent of the disk-space guards. Increasing drops can still trigger a
+capture below the threshold if the queue filled and partly drained between polls.
+Initial and periodic baselines still run; all triggers respect the cooldown.
 
 Use a directory under `/home` on the reported collector filesystem (44 GiB free),
 not RAM-backed `/tmp` or the nearly capacity-limited root filesystem. The budget

@@ -101,13 +101,23 @@ class CaptureTest(unittest.TestCase):
         trigger = peak.Trigger(self.args)
         self.assertEqual(trigger.observe(self.sample(), 0), 'baseline')
         trigger.captured('baseline', 0)
-        self.assertIsNone(trigger.observe(self.sample(length=75), 899))
-        self.assertEqual(trigger.observe(self.sample(length=75), 900), 'queue')
+        self.assertIsNone(trigger.observe(self.sample(length=90), 899))
+        self.assertIsNone(trigger.observe(self.sample(length=89), 900))
+        self.assertEqual(trigger.observe(self.sample(length=90), 900), 'queue')
         trigger.captured('queue', 900)
         self.assertEqual(trigger.observe(self.sample(drops=11), 1800), 'drops')
         trigger.captured('drops', 1800)
         self.assertIsNone(trigger.observe(self.sample(drops=11), 2700))
         self.assertEqual(trigger.observe(self.sample(drops=11), 3600), 'periodic-baseline')
+
+    def test_custom_queue_threshold(self):
+        self.args.max_bundles = 24
+        self.args.queue_threshold = .95
+        trigger = peak.Trigger(self.args)
+        trigger.observe(self.sample(), 0)
+        trigger.captured('baseline', 0)
+        self.assertIsNone(trigger.observe(self.sample(length=94), 900))
+        self.assertEqual(trigger.observe(self.sample(length=95), 900), 'queue')
 
     def test_resets_and_exporter_churn(self):
         self.args.max_bundles = 24
@@ -667,6 +677,7 @@ class ArgumentsTest(unittest.TestCase):
 
     def test_defaults_and_invalid_limits(self):
         args = peak.arguments([])
+        self.assertEqual(args.queue_threshold, .90)
         self.assertEqual((args.duration, args.cooldown, args.baseline_interval, args.max_bundles,
                           args.trace_seconds), (86400, 900, 3600, 24, 0))
         self.assertEqual((args.max_total_bytes, args.min_free_bytes, args.keep_bundles, args.profile_bytes),
@@ -675,7 +686,9 @@ class ArgumentsTest(unittest.TestCase):
                      ['--max-bundles', '25'], ['--max-bundles', '0'], ['--workers', '9'],
                      ['--duration', '0'], ['--pid', '0'], ['--thread-schedstats'],
                      ['--keep-bundles', '2'], ['--keep-bundles', '-1'], ['--max-total-bytes', '0'],
-                     ['--min-free-bytes', '-1'],
+                     ['--min-free-bytes', '-1'], ['--queue-threshold', '0'],
+                     ['--queue-threshold', '1.01'], ['--queue-threshold', 'nan'],
+                     ['--queue-threshold', 'inf'], ['--queue-threshold', '-0.1'],
                      ['--profile-bytes', str(128 * peak.MIB + 1)],
                      ['--metric-bytes', str(16 * peak.MIB + 1)]):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
