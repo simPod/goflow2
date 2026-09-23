@@ -18,7 +18,7 @@ jobs:
         run: |
           case "$GITHUB_REF_NAME" in
             perf/508-control-v222) go_version=1.23.6 ;;
-            perf/508-v222-go1255|perf/508-control-v226|perf/508-v226-old-protobuf-code|perf/508-v226-old-protobuf-runtime|perf/508-diagnostics) go_version=1.25.5 ;;
+            perf/508-v222-go1255|perf/508-control-v226|perf/508-v226-old-protobuf-code|perf/508-v226-old-protobuf-runtime|perf/508-diagnostics|perf/508-producer-pool) go_version=1.25.5 ;;
             *) exit 1 ;;
           esac
           echo "GO_VERSION=$go_version" >> "$GITHUB_ENV"
@@ -54,8 +54,10 @@ jobs:
             echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > dist/experiment.txt
           file "dist/$binary"
-          cp scripts/capture-peak.py docs/diagnostics-508.md dist/
-          (cd dist && sha256sum "$binary" capture-peak.py diagnostics-508.md > SHA256SUMS)
+          cp scripts/capture-peak.py docs/diagnostics-508.md docs/producer-pool-508.md docs/performance-investigation-508.md dist/
+          mkdir -p dist/adr
+          cp docs/adr/0001-independent-kafka-producers.md dist/adr/
+          (cd dist && sha256sum "$binary" capture-peak.py diagnostics-508.md producer-pool-508.md performance-investigation-508.md adr/0001-independent-kafka-producers.md > SHA256SUMS)
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         with:

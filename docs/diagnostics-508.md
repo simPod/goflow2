@@ -1,7 +1,11 @@
 # GoFlow2 peak diagnostics — issue 508
 
 Investigation history, measured findings, profile evidence and next experiments:
-[performance-investigation-508.md](https://github.com/simpod/goflow2/blob/perf/508-diagnostics/docs/performance-investigation-508.md).
+[performance-investigation-508.md](performance-investigation-508.md).
+
+For the producer-pool artifact, use [producer-pool-508.md](producer-pool-508.md)
+for the binary filename and producer-count flag. The profiling and capture
+instructions below also apply to that build.
 
 This experimental build is based on **v2.2.6**, pinned to **Go 1.25.5**, Linux
 amd64, `GOAMD64=v1`, and `CGO_ENABLED=0`. Dependencies are unchanged. It measures

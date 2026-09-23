@@ -1,6 +1,6 @@
 # GoFlow2 peak-loss investigation — issue 508
 
-Status: diagnostic data collected; dominant worker delay identified; remedy not yet implemented or validated.
+Status: diagnostic data collected; dominant worker delay identified; configurable producer-pool experiment implemented on `perf/508-producer-pool`; production benefit not yet validated. Alert work is explicitly deferred.
 
 Observation dates: 2026-09-20 through 2026-09-23. Times below are **Europe/Prague (CEST, UTC+02:00)** unless marked UTC. This document records the investigation through analysis of the September 23 peak captures. It is an investigation log, not an accepted architecture decision.
 
@@ -16,7 +16,7 @@ The collector receives more datagrams at peak than it can process. Its million-d
 
 The diagnostic build attributes about **89% of sampled worker handling time to the Kafka enqueue stage**. Peak goroutine profiles show most collector workers blocked sending messages to Sarama. Sarama's producer and topic dispatchers spend substantial CPU on channel handoffs, while partition handlers mostly wait for input. This is strong evidence of a **shared client-side dispatch/handoff throughput limit**. It is not evidence that broker processing is slow.
 
-The recommended next controlled experiment is **two independent Sarama asynchronous producer instances inside the same GoFlow process**, retaining the current receiver configuration. This is a proposal, not an implemented fix. More collector workers alone may just add waiting senders.
+The next controlled experiment is **two independent Sarama asynchronous producer instances inside the same GoFlow process**, retaining the current receiver configuration. It is now implemented on `perf/508-producer-pool`, but its production benefit is not yet measured. More collector workers alone may just add waiting senders. See [experiment instructions](producer-pool-508.md) and [ADR](adr/0001-independent-kafka-producers.md).
 
 No root-cause commit explaining all differences between releases has been proved. No production throughput fix has yet been deployed or verified.
 
@@ -360,7 +360,7 @@ go tool pprof -top "$BINARY" "$CAPTURES/10-queue/mutex.pb"
 
 Metrics and profiles make total host CPU saturation, protocol errors, sustained kernel receive loss, decoding, protobuf work, shared Prometheus summaries, and GC much weaker candidates for the primary observed peak limit. Some still consume resources and may become relevant after the dispatch limit is removed.
 
-## 11. Proposed next experiment: two independent producers
+## 11. Producer-pool experiment: design and implementation
 
 This means **two Sarama `AsyncProducer` instances**, not two Kafka brokers, not two topics, and not increasing GoFlow decoding workers.
 
@@ -380,12 +380,12 @@ Proposed:
 
 Each instance owns its own producer and topic dispatch goroutines. Distributing messages between them removes the requirement that all ~730k messages/s pass through one instance's shared dispatch stages. Each flow message is submitted to **one selected producer**, not copied to both. This is a routing rule, not an exactly-once Kafka delivery guarantee; existing retry and acknowledgement semantics remain unchanged.
 
-This is not supported by the current binary's configuration. It requires a code change, likely an optional **proposed** flag such as `-transport.kafka.producers=2` (not implemented). Keep a default of one so the experiment can switch back without changing binaries.
+The captured d55116d baseline binary does not support this setting. The new `perf/508-producer-pool` branch implements `-transport.kafka.producers=2`, with a default of one so the experiment can switch back without changing binaries. Positive counts are supported. Nonempty keys use stable producer affinity when partition hashing is enabled; the supplied configuration uses round-robin producer selection.
 
-Implementation outline:
+Implemented design:
 
 1. Refactor `KafkaDriver` to own a bounded slice of independently initialized producers with identical existing Kafka options.
-2. Select one producer per message, initially using round-robin selection with a concurrency-safe index. Measure the selection cost; avoid adding an unnecessary global mutex.
+2. Select one producer per message, using atomic round-robin selection without a shared hot-path mutex, or deterministic FNV-1a affinity for nonempty keys when hashing is enabled. Single-producer sends bypass the selector.
 3. Give each instance its own Sarama client/registry and result-channel drainer, so dispatch and client-level locks are not inadvertently shared.
 4. Add a `producer` label to producer-specific diagnostics. Aggregate rates/counts correctly in dashboards; do not add reservoir quantiles or average them into a fake global percentile.
 5. Preserve terminal error accounting. Close/drain every producer on shutdown, and clean up already-created instances if a later initialization fails.
@@ -410,7 +410,7 @@ Alternatives discussed but not selected as the first targeted experiment:
 
 ## 12. Capacity and overflow alert candidates
 
-These are proposed read-only queries/rules, **not deployed alerts**. Distinguish capacity headroom from buffer occupancy.
+**Deferred at the operator's request.** These are proposed read-only queries/rules, **not deployed alerts**. Return to this section after the producer-pool capacity experiment. Distinguish capacity headroom from buffer occupancy.
 
 ### Early warning: input approaches measured sustained capacity
 
@@ -459,11 +459,13 @@ The 90% queue threshold in `capture-peak.py` is only a **profile-capture trigger
 
 ## 13. Open follow-ups
 
-- [ ] Implement and validate the two-producer experiment only after the operator requests it.
+- [x] Implement the requested producer-count flag and independent producer pool on `perf/508-producer-pool`.
+- [ ] Validate one versus two producers under comparable production load; implementation alone does not establish the gain.
+- [ ] Resume alert design later, using section 12 and a newly measured capacity estimate.
 - [ ] Extend the **queue-wait histogram bucket range**: its current largest finite bucket is 4.194304 seconds, below the observed 7.4–7.5-second queue wait. Current queue-wait p99 is capped and misleading. The mean from `_sum/_count` remains usable.
 - [ ] Preserve raw captures and the exact d55116d binary outside this public source repository.
 - [ ] If a later test changes worker count, update the older dashboard panel's fixed 48-worker reference; use the new actual worker-state metric in preference to the constant.
 - [ ] If stages/profiles implicate kernel networking later, add TCP_INFO/qdisc or Linux perf evidence; saved `ss` output currently has socket memory but not full TCP_INFO.
 - [ ] Validate producer throughput/delivery separately: records encoded into requests can include retries; successes notifications remain off in the low-overhead baseline.
 
-No worker-count, producer-count, Kafka-client, or broker-setting change was made as part of writing this record.
+The producer-pool branch changes collector capability, not the server's running configuration. Deploying the new binary and selecting two producers is a separate operator action. No worker-count, broker-setting, or alert-rule change has been applied to production by this work.
