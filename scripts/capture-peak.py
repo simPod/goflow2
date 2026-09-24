@@ -27,6 +27,7 @@ SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z_0-9:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+\S+)
 LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z_0-9]*)\s*=\s*"((?:[^"\\]|\\[\\"n])*)"\s*(?:,|$)')
 QUEUE = 'goflow_diagnostics_queue_'
 DROP = 'goflow2_flow_dropped_packets_total'
+LISTENER_DROP = 'goflow_diagnostics_dropped_datagrams_total'
 
 
 def utc():
@@ -247,6 +248,7 @@ def fetch(url, limit, destination=None, stop=None, storage=None):
 
 def metrics(raw, listener):
     queues, drops, start = {}, {}, None
+    listener_drops = None
     for line in raw.decode('utf-8').splitlines():
         if not line or line.startswith('#'):
             continue
@@ -254,7 +256,7 @@ def metrics(raw, listener):
         if not match:
             continue
         name, text, number = match.groups()
-        if name not in (QUEUE + 'length', QUEUE + 'capacity', DROP, 'process_start_time_seconds'):
+        if name not in (QUEUE + 'length', QUEUE + 'capacity', DROP, LISTENER_DROP, 'process_start_time_seconds'):
             continue
         labels, pos = {}, 0
         text = text or ''
@@ -271,10 +273,16 @@ def metrics(raw, listener):
             queues[name] = value
         elif name == DROP:
             drops[tuple(sorted(labels.items()))] = value
+        elif name == LISTENER_DROP and labels.get('listener') == listener:
+            listener_drops = value
         elif name == 'process_start_time_seconds':
             start = value
     if QUEUE + 'length' not in queues or queues.get(QUEUE + 'capacity', 0) <= 0:
         raise ValueError('diagnostics queue length/capacity absent or capacity zero for ' + listener)
+    # Prefer the always-present listener total; do not count it again alongside
+    # the same events reported by legacy per-exporter counters.
+    if listener_drops is not None:
+        drops = {(('listener', listener),): listener_drops}
     return {'queue_ratio': queues[QUEUE + 'length'] / queues[QUEUE + 'capacity'],
             'drops': drops, 'process_start_time': start}
 

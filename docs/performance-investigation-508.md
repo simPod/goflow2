@@ -461,6 +461,33 @@ The 90% queue threshold in `capture-peak.py` is only a **profile-capture trigger
 
 ## 13. Open follow-ups
 
+### Follow-up: zero-valued drop metrics
+
+After deployment with two producers, Prometheus was healthy and the receive
+queue was empty, but the original drop panel had no current series. The original
+per-exporter CounterVec creates each label set only on its first drop. The
+operator requested real zeros from the collector, without increasing normal
+packet-processing overhead.
+
+The updated producer-pool build adds always-present
+`goflow_diagnostics_dropped_datagrams_total` and
+`goflow_diagnostics_dropped_bytes_total`, labeled only by listener. They sum
+per-socket counters on scrape. Updates occur only in the full nonblocking-queue
+branch, before the existing per-exporter callback. There are no added operations
+on successfully dispatched packets and no allocations or shared locks per drop.
+The extra drop update uses two local additions and two atomic stores; the
+microbenchmark is not a claim of zero end-to-end overhead on the production host.
+
+Receiver overflow, zero initialization, multiple sockets, blocking mode and
+concurrent scrapes are covered by tests. The capture script prefers these totals
+when present and falls back to the legacy counters for older binaries, without
+double counting. Dashboard rate queries preserve older series via fallback;
+they require the updated collector to report a real zero before the first drop.
+
+The original d55116d capture evidence and its metric semantics remain unchanged.
+
+### Remaining work
+
 - [x] Implement the requested producer-count flag and independent producer pool on `perf/508-producer-pool`.
 - [ ] Validate one versus two producers under comparable production load; implementation alone does not establish the gain.
 - [ ] Resume alert design later, using section 12 and a newly measured capacity estimate.

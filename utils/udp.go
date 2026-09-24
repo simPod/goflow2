@@ -212,6 +212,7 @@ func (r *UDPReceiver) receiveRoutine(udpconn *net.UDPConn, socket *diagnostics.S
 			case <-r.q:
 				return nil
 			default:
+				socket.Dropped(pkt.size)
 				if r.cb != nil {
 					r.cb.Dropped(Message{
 						Src:      pkt.src.AddrPort(),

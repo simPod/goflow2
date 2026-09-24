@@ -78,6 +78,19 @@ Scope this query to the collector instance in a shared Prometheus installation.
 Counts are records encoded in requests, including retries, not acknowledgements.
 Success notifications remain opt-in because they add per-message overhead.
 
+The updated build also exports listener-level drop totals from startup, rather
+than waiting for an exporter's first drop:
+
+```text
+goflow_diagnostics_dropped_datagrams_total{listener="sflow://:9801"} 0
+goflow_diagnostics_dropped_bytes_total{listener="sflow://:9801"} 0
+```
+
+They require the existing `-diagnostics` flag. They add no drop-accounting work
+to successfully dispatched packets; per-socket counters are updated only on
+queue overflow, then summed when scraped. This avoids a new shared hot-path
+counter. End-to-end production overhead is not independently benchmarked.
+
 Per-instance aggregate throughput:
 
 ```promql

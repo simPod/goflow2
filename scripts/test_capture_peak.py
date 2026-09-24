@@ -119,6 +119,23 @@ class CaptureTest(unittest.TestCase):
         self.assertIsNone(trigger.observe(self.sample(length=94), 900))
         self.assertEqual(trigger.observe(self.sample(length=95), 900), 'queue')
 
+    def test_listener_total_preferred_without_double_counting(self):
+        self.args.max_bundles = 24
+        def sample(total):
+            raw = exposition(drops=500) + (
+                '\n' + peak.LISTENER_DROP + '{listener="sflow://:9801"} ' + str(total) + '\n' +
+                peak.LISTENER_DROP + '{listener="sflow://:6343"} 999\n'
+            ).encode()
+            return peak.metrics(raw, self.args.listener)
+        before = sample(0)
+        self.assertEqual(before['drops'], {(('listener', 'sflow://:9801'),): 0})
+        trigger = peak.Trigger(self.args)
+        trigger.observe(before, 0)
+        trigger.captured('baseline', 0)
+        self.assertIsNone(trigger.observe(sample(0), 900))
+        self.assertEqual(trigger.observe(sample(1), 910), 'drops')
+        self.assertEqual(sample(1)['drops'], {(('listener', 'sflow://:9801'),): 1})
+
     def test_resets_and_exporter_churn(self):
         self.args.max_bundles = 24
         trigger = peak.Trigger(self.args)
