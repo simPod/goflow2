@@ -144,9 +144,13 @@ $ ./goflow2 -transport=kafka \
   -format=bin
 ```
 
-By default, the distribution will be randomized.
-In order to partition the field, you need to configure the `key`
-in the formatter.
+By default, records are distributed round-robin across partitions.
+To send records with the same key to the same partition, configure the `key`
+in the formatter and enable `-transport.kafka.hashing`.
+franz-go hashes keyed records consistently, but keys may move to different
+partitions when upgrading from the Sarama producer.
+Avoid running both producer versions against the same topic if consumers require
+per-key ordering during the upgrade.
 
 By default, compression is disabled when sending data to Kafka.
 To change the kafka compression type of the producer side configure the following option:
@@ -154,7 +158,14 @@ To change the kafka compression type of the producer side configure the followin
 ```
 -transport.kafka.compression=gzip
 ```
-The list of codecs is available in the [Sarama documentation](https://pkg.go.dev/github.com/Shopify/sarama#CompressionCodec).
+Supported codecs are `none`, `gzip`, `snappy`, `lz4`, and `zstd`.
+
+`-transport.kafka.flushbytes` now caps a record batch rather than setting a flush
+threshold. Batches are also limited by `-transport.kafka.maxmsgbytes`, and
+`-transport.kafka.flushfreq` sets the maximum linger time before a batch is sent.
+
+When Kafka is in use, producer and broker metrics are available on `/metrics`
+with the `goflow2_kafka_` prefix.
 
 
 By default, the collector will listen for IPFIX/NetFlow V9/NetFlow V5 on port 2055
