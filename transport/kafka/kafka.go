@@ -74,6 +74,14 @@ const (
 )
 
 var (
+	enqueueDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "goflow2",
+		Subsystem: "kafka",
+		Name:      "enqueue_duration_seconds",
+		Help:      "Time spent enqueueing a record in franz-go, including buffer waits but not broker delivery.",
+		Buckets:   prometheus.ExponentialBuckets(0.00001, 5, 9),
+	})
+
 	compressionCodecs = map[string]kgo.CompressionCodec{
 		"none":   kgo.NoCompression(),
 		"gzip":   kgo.GzipCompression(),
@@ -275,6 +283,7 @@ func newKafkaMetrics() *kprom.Metrics {
 
 // Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
+	start := time.Now()
 	d.producer.Produce(context.Background(), &kgo.Record{
 		Topic: d.kafkaTopic,
 		Key:   key,
@@ -287,6 +296,7 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 			}
 		}
 	})
+	enqueueDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
@@ -311,6 +321,7 @@ func GetServiceAddresses(srv string) (addrs []string, err error) {
 }
 
 func init() {
+	prometheus.MustRegister(enqueueDuration)
 	d := &KafkaDriver{
 		errors: make(chan error),
 	}
