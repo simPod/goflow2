@@ -1,7 +1,8 @@
-// Package kafka implements a Kafka transport using sarama.
+// Package kafka implements a Kafka transport using franz-go.
 package kafka
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -17,7 +18,12 @@ import (
 
 	"github.com/netsampler/goflow2/v3/transport"
 
-	sarama "github.com/Shopify/sarama"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kversion"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
+	"github.com/twmb/franz-go/plugin/kprom"
 )
 
 // KafkaDriver sends formatted messages to Kafka topics.
@@ -40,7 +46,7 @@ type KafkaDriver struct {
 	kafkaVersion          string
 	kafkaCompressionCodec string
 
-	producer sarama.AsyncProducer
+	producer *kgo.Client
 
 	errors chan error
 }
@@ -68,12 +74,20 @@ const (
 )
 
 var (
-	compressionCodecs = map[string]sarama.CompressionCodec{
-		strings.ToLower(sarama.CompressionNone.String()):   sarama.CompressionNone,
-		strings.ToLower(sarama.CompressionGZIP.String()):   sarama.CompressionGZIP,
-		strings.ToLower(sarama.CompressionSnappy.String()): sarama.CompressionSnappy,
-		strings.ToLower(sarama.CompressionLZ4.String()):    sarama.CompressionLZ4,
-		strings.ToLower(sarama.CompressionZSTD.String()):   sarama.CompressionZSTD,
+	enqueueDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "goflow2",
+		Subsystem: "kafka",
+		Name:      "enqueue_duration_seconds",
+		Help:      "Time spent enqueueing a record in franz-go, including buffer waits but not broker delivery.",
+		Buckets:   prometheus.ExponentialBuckets(0.00001, 5, 9),
+	})
+
+	compressionCodecs = map[string]kgo.CompressionCodec{
+		"none":   kgo.NoCompression(),
+		"gzip":   kgo.GzipCompression(),
+		"snappy": kgo.SnappyCompression(),
+		"lz4":    kgo.Lz4Compression(),
+		"zstd":   kgo.ZstdCompression(),
 	}
 
 	saslAlgorithms = map[KafkaSASLAlgorithm]bool{
@@ -106,7 +120,7 @@ func (d *KafkaDriver) Prepare() error {
 	flag.StringVar(&d.kafkaSrv, "transport.kafka.srv", "", "SRV record containing a list of Kafka brokers (or use brokers)")
 	flag.StringVar(&d.kafkaBrk, "transport.kafka.brokers", "127.0.0.1:9092,[::1]:9092", "Kafka brokers list separated by commas")
 	flag.IntVar(&d.kafkaMaxMsgBytes, "transport.kafka.maxmsgbytes", 1000000, "Kafka max message bytes")
-	flag.IntVar(&d.kafkaFlushBytes, "transport.kafka.flushbytes", int(sarama.MaxRequestSize), "Kafka flush bytes")
+	flag.IntVar(&d.kafkaFlushBytes, "transport.kafka.flushbytes", 100*1024*1024, "Kafka maximum batch bytes")
 	flag.DurationVar(&d.kafkaFlushFrequency, "transport.kafka.flushfreq", time.Second*5, "Kafka flush frequency")
 
 	flag.BoolVar(&d.kafkaHashing, "transport.kafka.hashing", false, "Enable partition hashing")
@@ -124,37 +138,32 @@ func (d *KafkaDriver) Errors() <-chan error {
 
 // Init configures the Kafka producer and establishes connections.
 func (d *KafkaDriver) Init() error {
-	kafkaConfigVersion, err := sarama.ParseKafkaVersion(d.kafkaVersion)
-	if err != nil {
-		return err
+	kafkaConfigVersion := kversion.FromString(d.kafkaVersion)
+	if kafkaConfigVersion == nil {
+		return fmt.Errorf("invalid Kafka version %q", d.kafkaVersion)
 	}
 
-	kafkaConfig := sarama.NewConfig()
-	kafkaConfig.Version = kafkaConfigVersion
-	kafkaConfig.Producer.Return.Successes = false
-	kafkaConfig.Producer.Return.Errors = true
-	kafkaConfig.Producer.MaxMessageBytes = d.kafkaMaxMsgBytes
-	kafkaConfig.Producer.Flush.Bytes = d.kafkaFlushBytes
-	kafkaConfig.Producer.Flush.Frequency = d.kafkaFlushFrequency
-	kafkaConfig.Producer.Partitioner = sarama.NewRoundRobinPartitioner
+	if d.kafkaMaxMsgBytes <= 0 || d.kafkaFlushBytes <= 0 || d.kafkaMaxMsgBytes > int(^uint32(0)>>1) || d.kafkaFlushBytes > int(^uint32(0)>>1) {
+		return errors.New("kafka message and batch byte limits must be positive and at most 2147483647")
+	}
+	batchBytes := min(d.kafkaMaxMsgBytes, d.kafkaFlushBytes)
+	opts := []kgo.Opt{
+		kgo.MaxVersions(kafkaConfigVersion),
+		kgo.ProducerBatchMaxBytes(int32(batchBytes)),
+		kgo.ProducerLinger(d.kafkaFlushFrequency),
+		kgo.RecordPartitioner(kgo.RoundRobinPartitioner()),
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
+		kgo.DisableIdempotentWrite(),
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.WithHooks(newKafkaMetrics()),
+	}
 
 	if d.kafkaCompressionCodec != "" {
-		/*
-			// when upgrading sarama, replace with:
-			// note: if the library adds more codecs, they will be supported natively
-			var cc *sarama.CompressionCodec
-
-			if err := cc.UnmarshalText([]byte(d.kafkaCompressionCodec)); err != nil {
-				return err
-			}
-			kafkaConfig.Producer.Compression = *cc
-		*/
-
-		if cc, ok := compressionCodecs[strings.ToLower(d.kafkaCompressionCodec)]; !ok {
+		cc, ok := compressionCodecs[strings.ToLower(d.kafkaCompressionCodec)]
+		if !ok {
 			return fmt.Errorf("compression codec does not exist")
-		} else {
-			kafkaConfig.Producer.Compression = cc
 		}
+		opts = append(opts, kgo.ProducerBatchCompression(cc))
 	}
 
 	if d.kafkaTLS {
@@ -162,13 +171,12 @@ func (d *KafkaDriver) Init() error {
 		if err != nil {
 			return fmt.Errorf("error initializing TLS: %v", err)
 		}
-		kafkaConfig.Net.TLS.Enable = true
-		kafkaConfig.Net.TLS.Config = &tls.Config{
+		tlsConfig := &tls.Config{
 			RootCAs:    rootCAs,
 			MinVersion: tls.VersionTLS12,
 		}
 
-		kafkaConfig.Net.TLS.Config.InsecureSkipVerify = d.kafkaTlsInsecure
+		tlsConfig.InsecureSkipVerify = d.kafkaTlsInsecure
 
 		if d.kafkaServerCA != "" {
 			serverCaFile, err := os.Open(d.kafkaServerCA)
@@ -197,7 +205,7 @@ func (d *KafkaDriver) Init() error {
 			certPool := x509.NewCertPool()
 			certPool.AddCert(serverCa)
 
-			kafkaConfig.Net.TLS.Config.RootCAs = certPool
+			tlsConfig.RootCAs = certPool
 		}
 
 		if d.kafkaClientCert != "" && d.kafkaClientKey != "" {
@@ -206,7 +214,7 @@ func (d *KafkaDriver) Init() error {
 				return fmt.Errorf("error initializing mTLS: %v", err)
 			}
 
-			kafkaConfig.Net.TLS.Config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				cert, err := tls.LoadX509KeyPair(d.kafkaClientCert, d.kafkaClientKey)
 				if err != nil {
 					return nil, err
@@ -214,11 +222,11 @@ func (d *KafkaDriver) Init() error {
 				return &cert, nil
 			}
 		}
-
+		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
 	}
 
 	if d.kafkaHashing {
-		kafkaConfig.Producer.Partitioner = sarama.NewHashPartitioner
+		opts = append(opts, kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)))
 	}
 
 	kafkaSASL := KafkaSASLAlgorithm(d.kafkaSASL)
@@ -228,70 +236,76 @@ func (d *KafkaDriver) Init() error {
 			return errors.New("sasl algorithm does not exist")
 		}
 
-		kafkaConfig.Net.SASL.Enable = true
-		kafkaConfig.Net.SASL.User = os.Getenv("KAFKA_SASL_USER")
-		kafkaConfig.Net.SASL.Password = os.Getenv("KAFKA_SASL_PASS")
-		if kafkaConfig.Net.SASL.User == "" && kafkaConfig.Net.SASL.Password == "" {
+		user := os.Getenv("KAFKA_SASL_USER")
+		password := os.Getenv("KAFKA_SASL_PASS")
+		if user == "" && password == "" {
 			return fmt.Errorf("kafka SASL config from environment was unsuccessful: KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set")
 		}
 
-		if kafkaSASL == KAFKA_SASL_SCRAM_SHA256 || kafkaSASL == KAFKA_SASL_SCRAM_SHA512 {
-			kafkaConfig.Net.SASL.Handshake = true
-
-			switch kafkaSASL {
-			case KAFKA_SASL_SCRAM_SHA512:
-				kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
-				}
-				kafkaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-			case KAFKA_SASL_SCRAM_SHA256:
-				kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
-				}
-				kafkaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
-			}
+		switch kafkaSASL {
+		case KAFKA_SASL_PLAIN:
+			opts = append(opts, kgo.SASL(plain.Auth{User: user, Pass: password}.AsMechanism()))
+		case KAFKA_SASL_SCRAM_SHA256:
+			opts = append(opts, kgo.SASL(scram.Auth{User: user, Pass: password}.AsSha256Mechanism()))
+		case KAFKA_SASL_SCRAM_SHA512:
+			opts = append(opts, kgo.SASL(scram.Auth{User: user, Pass: password}.AsSha512Mechanism()))
 		}
 	}
 
 	var addrs []string
 	if d.kafkaSrv != "" {
-		addrs, _ = GetServiceAddresses(d.kafkaSrv)
+		var err error
+		addrs, err = GetServiceAddresses(d.kafkaSrv)
+		if err != nil {
+			return err
+		}
 	} else {
 		addrs = strings.Split(d.kafkaBrk, ",")
 	}
 
-	kafkaProducer, err := sarama.NewAsyncProducer(addrs, kafkaConfig)
+	opts = append(opts, kgo.SeedBrokers(addrs...))
+	kafkaProducer, err := kgo.NewClient(opts...)
 	if err != nil {
+		return err
+	}
+	if err := kafkaProducer.Ping(context.Background()); err != nil {
+		kafkaProducer.Close()
 		return err
 	}
 	d.producer = kafkaProducer
 
-	go func() {
-		for msg := range kafkaProducer.Errors() {
-			select {
-			case d.errors <- &KafkaTransportError{msg}:
-			default:
-			}
-		}
-		close(d.errors)
-	}()
+	return nil
+}
 
-	return err
+func newKafkaMetrics() *kprom.Metrics {
+	return kprom.NewMetrics("goflow2", kprom.Subsystem("kafka"), kprom.Registerer(prometheus.DefaultRegisterer))
 }
 
 // Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
-	d.producer.Input() <- &sarama.ProducerMessage{
+	start := time.Now()
+	d.producer.Produce(context.Background(), &kgo.Record{
 		Topic: d.kafkaTopic,
-		Key:   sarama.ByteEncoder(key),
-		Value: sarama.ByteEncoder(data),
-	}
+		Key:   key,
+		Value: data,
+	}, func(_ *kgo.Record, err error) {
+		if err != nil {
+			select {
+			case d.errors <- &KafkaTransportError{err}:
+			default:
+			}
+		}
+	})
+	enqueueDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
 // Close stops the producer and releases resources.
 func (d *KafkaDriver) Close() error {
-	return d.producer.Close()
+	err := d.producer.Flush(context.Background())
+	d.producer.Close()
+	close(d.errors)
+	return err
 }
 
 // GetServiceAddresses resolves SRV records into broker addresses.
@@ -307,6 +321,7 @@ func GetServiceAddresses(srv string) (addrs []string, err error) {
 }
 
 func init() {
+	prometheus.MustRegister(enqueueDuration)
 	d := &KafkaDriver{
 		errors: make(chan error),
 	}
