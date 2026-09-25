@@ -1,7 +1,11 @@
 # GoFlow2 peak diagnostics — issue 508
 
 Investigation history, measured findings, profile evidence and next experiments:
-[performance-investigation-508.md](https://github.com/simpod/goflow2/blob/perf/508-diagnostics/docs/performance-investigation-508.md).
+[performance-investigation-508.md](performance-investigation-508.md).
+
+For the producer-pool artifact, use [producer-pool-508.md](producer-pool-508.md)
+for the binary filename and producer-count flag. The profiling and capture
+instructions below also apply to that build.
 
 This experimental build is based on **v2.2.6**, pinned to **Go 1.25.5**, Linux
 amd64, `GOAMD64=v1`, and `CGO_ENABLED=0`. Dependencies are unchanged. It measures
@@ -172,6 +176,8 @@ from the pinned Go runtime. Existing Go memory metrics are preserved.
 | `goflow_diagnostics_socket_datagrams_total` | Reads completed before enqueue/drop; labels `listener`, `socket` |
 | `goflow_diagnostics_socket_bytes_total` | Bytes received before dispatch |
 | `goflow_diagnostics_socket_errors_total` | Setup/read errors, including socket shutdown |
+| `goflow_diagnostics_dropped_datagrams_total` | Always-present listener total of full-queue drops, initialized to zero |
+| `goflow_diagnostics_dropped_bytes_total` | Always-present listener total of received payload bytes discarded by the full queue |
 | `goflow_diagnostics_sample_every` | Sampling interval per worker (default 1024; first datagram sampled) |
 | `goflow_diagnostics_stage_seconds` | Histogram with `_sum`, `_count`, `_bucket`; unscaled sampled datagram timings |
 | `goflow_diagnostics_sample_errors_total{outcome}` | Sampled error/panic outcomes, including recovered panics |
@@ -194,6 +200,11 @@ Only sampled packets incur stage clock reads and histogram publication. Each
 visited stage produces **one observation per sampled datagram**, not one per flow
 message. Receiver counters and exact busy flags use per-socket/per-worker slots;
 no exporter labels or per-message shared diagnostic counter updates are added.
+Listener drop totals are summed from per-socket counters at scrape time. Only
+the full-queue drop branch updates them: two local additions and two atomic
+stores, without allocation or a shared lock. Successful dispatch has no extra
+drop-counter operation. The old per-exporter counters remain available. These
+totals exclude kernel/network loss and blocking-mode waits.
 Queue wait uses the existing wall-clock timestamp and can be affected by clock
 adjustments. Very long stalls are not added to completed-duration totals until
 they finish. Use active state and profiles alongside completed timings.
@@ -262,4 +273,8 @@ context-switch metrics should be graphed alongside the collector metrics.
 Do not treat the absence of a metric as zero. Stage series appear only after a
 sample reaches them, error series after their first event, and broker series
 depend on established connections. The standard application-drop series may be
-absent after restart until its first drop.
+absent after restart until its first drop. In the updated producer-pool build,
+the two listener-level diagnostic drop counters above explicitly export zero
+from startup, even before any traffic. A rate still needs at least two scrapes.
+The capture script prefers the listener total when present and falls back to
+legacy per-exporter counters for older builds; it never adds both together.

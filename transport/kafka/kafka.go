@@ -13,11 +13,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/netsampler/goflow2/v2/transport"
 
 	sarama "github.com/Shopify/sarama"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // KafkaDriver sends formatted messages to Kafka topics.
@@ -40,14 +42,20 @@ type KafkaDriver struct {
 	kafkaVersion          string
 	kafkaCompressionCodec string
 
-	producer                 sarama.AsyncProducer
+	kafkaProducers           int
+	producers                []producerMember
+	nextProducer             atomic.Uint64
+	poolSize                 prometheus.Gauge
+	poolRegisterer           prometheus.Registerer
 	kafkaDiagnostics         bool
 	kafkaDiagnosticSuccesses bool
-	diagnostics              *kafkaDiagnostics
-
-	q chan bool
 
 	errors chan error
+}
+
+type producerMember struct {
+	producer    sarama.AsyncProducer
+	diagnostics *kafkaDiagnostics // Also owns the result drainer when diagnostics are disabled.
 }
 
 // KafkaTransportError wraps errors returned by the Kafka client.
@@ -95,6 +103,7 @@ var (
 )
 
 func (d *KafkaDriver) Prepare() error {
+	flag.IntVar(&d.kafkaProducers, "transport.kafka.producers", 1, "Number of independent Kafka producers (must be positive)")
 	flag.BoolVar(&d.kafkaDiagnostics, "diagnostics.kafka", false, "Expose Kafka queue and existing Sarama metrics independently of global diagnostics")
 	flag.BoolVar(&d.kafkaDiagnosticSuccesses, "diagnostics.kafka.successes", false, "With diagnostics.kafka, drain and count successful producer completions (extra per-message overhead)")
 	flag.BoolVar(&d.kafkaTLS, "transport.kafka.tls", false, "Use TLS to connect to Kafka")
@@ -131,15 +140,69 @@ func (d *KafkaDriver) Errors() <-chan error {
 
 // Init configures the Kafka producer and establishes connections.
 func (d *KafkaDriver) Init() error {
-	if d.diagnostics != nil {
-		return errors.New("Kafka diagnostics producer is already initialized; close it before reinitializing")
+	return d.initProducers(sarama.NewAsyncProducer)
+}
+
+// Init and Close must be serialized. Callers must quiesce Send before Close.
+// Failed initialization releases all resources and can be retried.
+func (d *KafkaDriver) initProducers(factory func([]string, *sarama.Config) (sarama.AsyncProducer, error)) error {
+	if len(d.producers) != 0 {
+		return errors.New("Kafka producer pool is already initialized; close it before reinitializing")
 	}
+	if d.kafkaProducers <= 0 {
+		return errors.New("transport.kafka.producers must be positive")
+	}
+	var addrs []string
+	if d.kafkaSrv != "" {
+		addrs, _ = GetServiceAddresses(d.kafkaSrv)
+	} else {
+		addrs = strings.Split(d.kafkaBrk, ",")
+	}
+	d.nextProducer.Store(0)
+	for i := 0; i < d.kafkaProducers; i++ {
+		config := sarama.NewConfig()
+		if err := d.configure(config); err != nil {
+			config.MetricRegistry.UnregisterAll()
+			return errors.Join(fmt.Errorf("Kafka producer %d: %w", i, err), d.Close())
+		}
+		if d.kafkaProducers > 1 {
+			config.ClientID += "-" + strconv.Itoa(i)
+		}
+		producer, err := factory(addrs, config)
+		if err != nil {
+			config.MetricRegistry.UnregisterAll()
+			return errors.Join(fmt.Errorf("Kafka producer %d: %w", i, err), d.Close())
+		}
+		diag := &kafkaDiagnostics{registry: config.MetricRegistry, done: make(chan struct{})}
+		if d.kafkaDiagnostics {
+			diag = newKafkaDiagnostics(config.MetricRegistry, producer.Input(), d.kafkaDiagnosticSuccesses)
+		}
+		d.producers = append(d.producers, producerMember{producer, diag})
+		// Start every drainer before any failure path can call AsyncClose.
+		go diag.drain(producer, d.errors)
+		if d.kafkaDiagnostics {
+			if err := diag.registerProducer(i); err != nil {
+				return errors.Join(fmt.Errorf("Kafka producer %d diagnostics: %w", i, err), d.Close())
+			}
+		}
+	}
+	if d.kafkaDiagnostics {
+		d.poolSize = prometheus.NewGauge(prometheus.GaugeOpts{Name: "goflow2_kafka_producers", Help: "Number of independent Kafka producer instances."})
+		d.poolSize.Set(float64(len(d.producers)))
+		if err := prometheus.DefaultRegisterer.Register(d.poolSize); err != nil {
+			return errors.Join(err, d.Close())
+		}
+		d.poolRegisterer = prometheus.DefaultRegisterer
+	}
+	return nil
+}
+
+func (d *KafkaDriver) configure(kafkaConfig *sarama.Config) error {
 	kafkaConfigVersion, err := sarama.ParseKafkaVersion(d.kafkaVersion)
 	if err != nil {
 		return err
 	}
 
-	kafkaConfig := sarama.NewConfig()
 	kafkaConfig.Version = kafkaConfigVersion
 	kafkaConfig.Producer.Return.Successes = d.kafkaDiagnostics && d.kafkaDiagnosticSuccesses
 	kafkaConfig.Producer.Return.Errors = true
@@ -263,59 +326,29 @@ func (d *KafkaDriver) Init() error {
 		}
 	}
 
-	var addrs []string
-	if d.kafkaSrv != "" {
-		addrs, _ = GetServiceAddresses(d.kafkaSrv)
-	} else {
-		addrs = strings.Split(d.kafkaBrk, ",")
-	}
-
-	kafkaProducer, err := sarama.NewAsyncProducer(addrs, kafkaConfig)
-	if err != nil {
-		return err
-	}
-	d.producer = kafkaProducer
-	if d.kafkaDiagnostics {
-		diag := newKafkaDiagnostics(kafkaConfig.MetricRegistry, kafkaProducer.Input(), d.kafkaDiagnosticSuccesses)
-		if err := diag.register(); err != nil {
-			_ = kafkaProducer.Close()
-			return err
-		}
-		d.diagnostics = diag
-		go diag.drain(kafkaProducer, d.errors)
-		return nil
-	}
-
-	d.q = make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case msg := <-kafkaProducer.Errors():
-				var err error
-				if msg != nil {
-					err = &KafkaTransportError{msg}
-				}
-				select {
-				case d.errors <- err:
-				default:
-				}
-
-				if msg == nil {
-					return
-				}
-			case <-d.q:
-				return
-			}
-		}
-	}()
-
-	return err
+	return nil
 }
 
 // Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
-	d.producer.Input() <- &sarama.ProducerMessage{
+	if len(d.producers) == 0 {
+		return errors.New("Kafka producer pool is not initialized")
+	}
+	index := uint64(0)
+	if len(d.producers) > 1 {
+		if d.kafkaHashing && len(key) > 0 {
+			// FNV-1a gives stable affinity without allocating a hash object.
+			index = 14695981039346656037
+			for _, b := range key {
+				index ^= uint64(b)
+				index *= 1099511628211
+			}
+		} else {
+			index = d.nextProducer.Add(1) - 1
+		}
+		index %= uint64(len(d.producers))
+	}
+	d.producers[index].producer.Input() <- &sarama.ProducerMessage{
 		Topic: d.kafkaTopic,
 		Key:   sarama.ByteEncoder(key),
 		Value: sarama.ByteEncoder(data),
@@ -323,24 +356,34 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 	return nil
 }
 
-// Close stops the producer and releases resources.
+// Close flushes all producers in parallel and is idempotent. Only errors drained
+// after shutdown starts are returned; earlier errors use Errors and diagnostics.
+// Send must not run concurrently with Close. A closed driver can be initialized again.
 func (d *KafkaDriver) Close() error {
-	if diag := d.diagnostics; diag != nil {
-		diag.closing.Store(true)
-		d.producer.AsyncClose()
+	for _, member := range d.producers {
+		member.diagnostics.closing.Store(true)
+	}
+	for _, member := range d.producers {
+		member.producer.AsyncClose()
+	}
+	var closeErrors sarama.ProducerErrors
+	for _, member := range d.producers {
+		diag := member.diagnostics
 		<-diag.done
-		diag.registerer.Unregister(diag)
-		d.diagnostics = nil
-		if len(diag.closeErrors) > 0 {
-			return diag.closeErrors
+		closeErrors = append(closeErrors, diag.closeErrors...)
+		if diag.registerer != nil {
+			diag.registerer.Unregister(diag)
 		}
-		return nil
+		diag.registry.UnregisterAll()
 	}
-	if err := d.producer.Close(); err != nil {
-		close(d.q)
-		return err
+	d.producers = nil
+	if d.poolRegisterer != nil {
+		d.poolRegisterer.Unregister(d.poolSize)
 	}
-	close(d.q)
+	d.poolSize, d.poolRegisterer = nil, nil
+	if len(closeErrors) > 0 {
+		return closeErrors
+	}
 	return nil
 }
 

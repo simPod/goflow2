@@ -79,8 +79,16 @@ func newKafkaDiagnostics(registry metrics.Registry, input chan<- *sarama.Produce
 }
 
 func (d *kafkaDiagnostics) register() error {
-	d.registerer = prometheus.DefaultRegisterer
-	return d.registerer.Register(d)
+	return d.registerProducer(0)
+}
+
+func (d *kafkaDiagnostics) registerProducer(index int) error {
+	r := prometheus.WrapRegistererWith(prometheus.Labels{"producer": strconv.Itoa(index)}, prometheus.DefaultRegisterer)
+	if err := r.Register(d); err != nil {
+		return err
+	}
+	d.registerer = r
+	return nil
 }
 
 func (d *kafkaDiagnostics) Describe(ch chan<- *prometheus.Desc) {
@@ -180,14 +188,18 @@ func (d *kafkaDiagnostics) drain(producer sarama.AsyncProducer, forward chan<- e
 			if msg == nil {
 				continue
 			}
-			d.errors.WithLabelValues(producerErrorCode(msg.Err)).Inc()
+			if d.errors != nil {
+				d.errors.WithLabelValues(producerErrorCode(msg.Err)).Inc()
+			}
 			if d.closing.Load() {
 				d.closeErrors = append(d.closeErrors, msg)
 			}
 			select {
 			case forward <- &KafkaTransportError{msg}:
 			default:
-				d.drops.Inc()
+				if d.drops != nil {
+					d.drops.Inc()
+				}
 			}
 		case msg, ok := <-successes:
 			if !ok {

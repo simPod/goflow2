@@ -39,10 +39,25 @@ type worker struct {
 // Socket counters use single-writer cumulative stores, not contended increments.
 // Read errors include socket shutdown errors. Counts are published before dispatch.
 type Socket struct {
-	datagrams atomic.Uint64
-	bytes     atomic.Uint64
-	errors    atomic.Uint64
-	n, b, e   uint64
+	datagrams        atomic.Uint64
+	bytes            atomic.Uint64
+	errors           atomic.Uint64
+	n, b, e          uint64
+	droppedDatagrams atomic.Uint64
+	droppedBytes     atomic.Uint64
+	dn, db           uint64
+}
+
+// Dropped publishes a datagram rejected by the full, nonblocking dispatch queue.
+// The socket goroutine is the sole writer, as for Received. It is nil-safe.
+func (s *Socket) Dropped(bytes int) {
+	if s == nil {
+		return
+	}
+	s.dn++
+	s.db += uint64(bytes)
+	s.droppedDatagrams.Store(s.dn)
+	s.droppedBytes.Store(s.db)
 }
 
 // Received publishes a successful socket read before it enters the dispatch queue.
@@ -74,7 +89,7 @@ type Recorder struct {
 	queue    func() (int, int)
 	duration *prometheus.HistogramVec
 	errors   *prometheus.CounterVec
-	desc     [7]*prometheus.Desc
+	desc     [9]*prometheus.Desc
 }
 
 // NewRecorder allocates fixed worker slots. Zero sampleEvery selects the default.
@@ -87,14 +102,14 @@ func NewRecorder(listener string, sampleEvery uint64, workerCount int) *Recorder
 	labels := prometheus.Labels{"listener": listener}
 	r.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "goflow_diagnostics_stage_seconds", Help: "Unscaled sampled datagram duration; repeated stage calls are summed per datagram.", ConstLabels: labels, Buckets: prometheus.ExponentialBuckets(0.000001, 4, 12)}, []string{"stage"})
 	r.errors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "goflow_diagnostics_sample_errors_total", Help: "Sampled datagrams ending in error or panic.", ConstLabels: labels}, []string{"outcome"})
-	names := []string{"queue_length", "queue_capacity", "workers", "sample_every", "socket_datagrams_total", "socket_bytes_total", "socket_errors_total"}
-	help := []string{"Dispatch queue length at scrape time.", "Dispatch queue capacity.", "Worker count by exact busy state and sampled detail. Detailed stages describe sampled packets only.", "One in this many datagrams is sampled per worker (first is sampled).", "Received UDP datagrams before dispatch, including empty datagrams.", "Received UDP bytes before dispatch.", "Socket receive/setup errors, including shutdown read errors."}
+	names := []string{"queue_length", "queue_capacity", "workers", "sample_every", "socket_datagrams_total", "socket_bytes_total", "socket_errors_total", "dropped_datagrams_total", "dropped_bytes_total"}
+	help := []string{"Dispatch queue length at scrape time.", "Dispatch queue capacity.", "Worker count by exact busy state and sampled detail. Detailed stages describe sampled packets only.", "One in this many datagrams is sampled per worker (first is sampled).", "Received UDP datagrams before dispatch, including empty datagrams.", "Received UDP bytes before dispatch.", "Socket receive/setup errors, including shutdown read errors.", "UDP datagrams dropped because the nonblocking dispatch queue is full, summed across listener sockets.", "Received UDP payload bytes dropped because the nonblocking dispatch queue is full, summed across listener sockets."}
 	for i, name := range names {
 		var variable []string
 		if i == 2 {
 			variable = []string{"state"}
 		}
-		if i >= 4 {
+		if i >= 4 && i <= 6 {
 			variable = []string{"socket"}
 		}
 		r.desc[i] = prometheus.NewDesc("goflow_diagnostics_"+name, help[i], variable, labels)
@@ -266,13 +281,18 @@ func (r *Recorder) Collect(ch chan<- prometheus.Metric) {
 	for i, n := range stages {
 		ch <- prometheus.MustNewConstMetric(r.desc[2], prometheus.GaugeValue, float64(n), "sampled_"+stageNames[i])
 	}
+	var droppedDatagrams, droppedBytes uint64
 	for i := range r.sockets {
 		s := &r.sockets[i]
+		droppedDatagrams += s.droppedDatagrams.Load()
+		droppedBytes += s.droppedBytes.Load()
 		label := strconv.Itoa(i)
 		for j, v := range []uint64{s.datagrams.Load(), s.bytes.Load(), s.errors.Load()} {
 			ch <- prometheus.MustNewConstMetric(r.desc[4+j], prometheus.CounterValue, float64(v), label)
 		}
 	}
+	ch <- prometheus.MustNewConstMetric(r.desc[7], prometheus.CounterValue, float64(droppedDatagrams))
+	ch <- prometheus.MustNewConstMetric(r.desc[8], prometheus.CounterValue, float64(droppedBytes))
 	r.duration.Collect(ch)
 	r.errors.Collect(ch)
 }

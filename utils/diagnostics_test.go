@@ -43,6 +43,182 @@ func diagnosticValue(t *testing.T, registry *prometheus.Registry, name, label, v
 	return 0
 }
 
+type diagnosticsDropCallback func(Message)
+
+func (f diagnosticsDropCallback) Dropped(msg Message) { f(msg) }
+
+func TestDiagnosticsDropsSurviveSessionReset(t *testing.T) {
+	recorder := diagnostics.NewRecorder("test", 1024, 1)
+	r, err := NewUDPReceiver(&UDPReceiverConfig{Workers: 1, Sockets: 1, QueueSize: 1, Diagnostics: recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(recorder)
+	// Stop resets session channels, but the receiver keeps its lifetime counters.
+	if err := r.Start("127.0.0.1", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	recorder.Socket(0).Dropped(3)
+	if err := r.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if got := diagnosticValue(t, registry, "dropped_datagrams_total", "", ""); got != 1 {
+		t.Fatalf("drop count after session reset = %v, want 1", got)
+	}
+	if err := r.Start("127.0.0.1", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	recorder.Socket(0).Dropped(5)
+	if got := diagnosticValue(t, registry, "dropped_datagrams_total", "", ""); got != 2 {
+		t.Fatalf("drop count after reuse = %v, want 2", got)
+	}
+	if got := diagnosticValue(t, registry, "dropped_bytes_total", "", ""); got != 8 {
+		t.Fatalf("drop bytes after reuse = %v, want 8", got)
+	}
+}
+
+// A capacity-one queue and no decoder make overflow independent of worker timing.
+func TestDiagnosticsDispatchDrops(t *testing.T) {
+	for _, blocking := range []bool{false, true} {
+		name := "overflow"
+		if blocking {
+			name = "blocking"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder := diagnostics.NewRecorder("test", 1024, 1)
+			registry := prometheus.NewPedanticRegistry()
+			callbacks := make(chan string, 2)
+			var callbackDrops float64 // used only by the receiver goroutine
+			r, err := NewUDPReceiver(&UDPReceiverConfig{
+				Workers: 1, Sockets: 1, QueueSize: 1, Blocking: blocking, Diagnostics: recorder,
+				ReceiverCallback: diagnosticsDropCallback(func(msg Message) {
+					callbackDrops++
+					if got := diagnosticValue(t, registry, "dropped_datagrams_total", "", ""); got != callbackDrops {
+						t.Errorf("counter before callback = %v, want %v", got, callbackDrops)
+					}
+					callbacks <- string(msg.Payload)
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry.MustRegister(recorder)
+			families, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+			present := 0
+			for _, f := range families {
+				if f.GetName() == "goflow_diagnostics_dropped_datagrams_total" || f.GetName() == "goflow_diagnostics_dropped_bytes_total" {
+					if len(f.Metric) != 1 || f.Metric[0].Counter == nil {
+						t.Fatalf("expected one drop counter: %v", f)
+					}
+					present++
+				}
+			}
+			if present != 2 {
+				t.Fatalf("initial drop counters: count=%d", present)
+			}
+			checkDrops := func(datagrams, bytes float64) {
+				t.Helper()
+				for name, want := range map[string]float64{"dropped_datagrams_total": datagrams, "dropped_bytes_total": bytes} {
+					if got := diagnosticValue(t, registry, name, "", ""); got != want {
+						t.Fatalf("%s = %v, want %v", name, got, want)
+					}
+				}
+			}
+			checkDrops(0, 0)
+			conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- r.receiveRoutine(conn, recorder.Socket(0)) }()
+			defer func() {
+				close(r.q)
+				conn.Close()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Error("receiver did not stop")
+				}
+				for len(r.dispatch) > 0 {
+					packetPool.Put(<-r.dispatch)
+				}
+			}()
+			sender, err := net.DialUDP("udp4", nil, conn.LocalAddr().(*net.UDPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sender.Close()
+			send := func(payload string) {
+				t.Helper()
+				if _, err := sender.Write([]byte(payload)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitValue := func(name string, want float64) {
+				t.Helper()
+				deadline := time.Now().Add(time.Second)
+				for diagnosticValue(t, registry, name, "", "") != want {
+					if time.Now().After(deadline) {
+						t.Fatalf("timed out waiting for %s = %v", name, want)
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+			take := func(want string) {
+				t.Helper()
+				select {
+				case pkt := <-r.dispatch:
+					got := string(pkt.payload[:pkt.size])
+					packetPool.Put(pkt)
+					if got != want {
+						t.Fatalf("queued payload = %q, want %q", got, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("packet did not reach queue")
+				}
+			}
+			send("queued")
+			waitValue("queue_length", 1)
+			checkDrops(0, 0)
+			if blocking {
+				send("blocked")
+				waitValue("socket_datagrams_total", 2)
+				checkDrops(0, 0)
+				take("queued")
+				take("blocked")
+				checkDrops(0, 0)
+			} else {
+				for _, payload := range []string{"abc", "12345"} {
+					send(payload)
+					select {
+					case got := <-callbacks:
+						if got != payload {
+							t.Fatalf("callback payload = %q, want %q", got, payload)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("drop callback did not fire")
+					}
+				}
+				checkDrops(2, 8)
+				take("queued")
+				send("queued again")
+				take("queued again")
+				checkDrops(2, 8)
+			}
+			select {
+			case payload := <-callbacks:
+				t.Fatalf("unexpected drop callback: %q", payload)
+			default:
+			}
+		})
+	}
+}
+
 func TestDiagnosticsWorkerCleanup(t *testing.T) {
 	for _, outcome := range []string{"error", "panic"} {
 		t.Run(outcome, func(t *testing.T) {

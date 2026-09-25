@@ -195,7 +195,7 @@ func TestDiagnosticsDrainAndLifecycle(t *testing.T) {
 		// Count shutdown errors too, and preserve Close's error result.
 		d.closing.Store(true)
 		go d.drain(p, forward)
-		driver := &KafkaDriver{producer: p, diagnostics: d}
+		driver := &KafkaDriver{producers: []producerMember{{p, d}}}
 		closed := make(chan error, 1)
 		go func() { closed <- driver.Close() }()
 		select {
@@ -207,7 +207,7 @@ func TestDiagnosticsDrainAndLifecycle(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("shutdown blocked")
 		}
-		if driver.diagnostics != nil {
+		if driver.producers != nil {
 			t.Fatal("collector not released")
 		}
 		if len(gatherDiagnostics(t, r)) != 0 {

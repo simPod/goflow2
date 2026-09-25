@@ -69,6 +69,7 @@ func TestDiagnosticsConcurrentScrape(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 1000; i++ {
 				r.Socket(id).Received(64)
+				r.Socket(id).Dropped(64)
 				trace := r.Begin(id, time.Time{})
 				trace.SetStage(Decode)
 				trace.Finish(nil, false)
@@ -83,11 +84,82 @@ func TestDiagnosticsConcurrentScrape(t *testing.T) {
 		}
 	}
 	wg.Wait()
+	assertDropTotals(t, registry, 2000, 128000)
 	for id := 0; id < 2; id++ {
 		s := r.Socket(id)
 		if s.datagrams.Load() != 1000 || s.bytes.Load() != 64000 || s.errors.Load() != 1 {
 			t.Fatal("socket snapshot mismatch")
 		}
+	}
+}
+
+func assertDropTotals(t *testing.T, registry *prometheus.Registry, datagrams, bytes float64) {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]float64{
+		"goflow_diagnostics_dropped_datagrams_total": datagrams,
+		"goflow_diagnostics_dropped_bytes_total":     bytes,
+	}
+	for _, f := range families {
+		value, ok := want[f.GetName()]
+		if !ok {
+			continue
+		}
+		if f.GetType() != dto.MetricType_COUNTER || len(f.Metric) != 1 {
+			t.Fatalf("expected one listener counter: %v", f)
+		}
+		m := f.Metric[0]
+		if len(m.Label) != 1 || m.Label[0].GetName() != "listener" || m.Label[0].GetValue() != "test" {
+			t.Fatalf("unexpected drop labels: %v", m.Label)
+		}
+		if got := m.Counter.GetValue(); got != value {
+			t.Errorf("%s = %v, want %v", f.GetName(), got, value)
+		}
+		delete(want, f.GetName())
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing drop counters: %v", want)
+	}
+}
+
+func TestDiagnosticsDropTotals(t *testing.T) {
+	r := NewRecorder("test", 1024, 1)
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(r)
+	assertDropTotals(t, registry, 0, 0)
+	r = NewRecorder("test", 1024, 1)
+	r.BindReceiver(1, 3, nil)
+	registry = prometheus.NewPedanticRegistry()
+	registry.MustRegister(r)
+	assertDropTotals(t, registry, 0, 0)
+	r.Socket(0).Received(100)
+	r.Socket(1).Received(200)
+	assertDropTotals(t, registry, 0, 0)
+	r.Socket(0).Dropped(7)
+	r.Socket(0).Dropped(11)
+	r.Socket(1).Dropped(23)
+	assertDropTotals(t, registry, 3, 41)
+	var disabled *Socket
+	disabled.Dropped(99)
+}
+
+func BenchmarkDiagnosticsDropped(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		var socket *Socket
+		if enabled {
+			name = "enabled"
+			socket = &Socket{}
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				socket.Dropped(1400)
+			}
+		})
 	}
 }
 

@@ -52,6 +52,12 @@ def run(binary, enabled):
                     raise AssertionError('profiling exposed on public listener')
                 except urllib.error.HTTPError as error:
                     assert error.code == 404, error
+            if enabled:
+                initial = get(public + '/metrics').decode().splitlines()
+                for name in ['goflow_diagnostics_dropped_datagrams_total',
+                             'goflow_diagnostics_dropped_bytes_total']:
+                    samples = [line for line in initial if line.startswith(name + '{')]
+                    assert len(samples) == 1 and float(samples[0].split()[-1]) == 0, name
             # Valid sFlow v5 datagram with one empty flow sample: still produces
             # one protobuf flow message and exercises every stage including Send.
             payload = struct.pack('!17I', 5, 1, 0x7f000001, 0, 1, 1000, 1,
