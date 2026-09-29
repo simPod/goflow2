@@ -165,6 +165,10 @@ threshold. Batches are also limited by `-transport.kafka.maxmsgbytes`, and
 
 When Kafka is in use, producer and broker metrics are available on `/metrics`
 with the `goflow2_kafka_` prefix.
+`goflow2_kafka_producer_errors_total{code="..."}` counts records that failed
+to produce; `goflow2_kafka_error_forwarding_dropped_total` counts error
+notifications that could not be forwarded for logging. These are distinct from
+UDP packets dropped before processing.
 
 
 By default, the collector will listen for IPFIX/NetFlow V9/NetFlow V5 on port 2055

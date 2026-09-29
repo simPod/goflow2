@@ -19,6 +19,7 @@ import (
 	"github.com/netsampler/goflow2/v2/transport"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kversion"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -80,6 +81,18 @@ var (
 		Name:      "enqueue_duration_seconds",
 		Help:      "Time spent enqueueing a record in franz-go, including buffer waits but not broker delivery.",
 		Buckets:   prometheus.ExponentialBuckets(0.00001, 5, 9),
+	})
+	producerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "goflow2",
+		Subsystem: "kafka",
+		Name:      "producer_errors_total",
+		Help:      "Kafka records that failed to produce, by bounded error code.",
+	}, []string{"code"})
+	errorForwardingDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "goflow2",
+		Subsystem: "kafka",
+		Name:      "error_forwarding_dropped_total",
+		Help:      "Kafka error notifications dropped because the application error channel was not ready.",
 	})
 
 	compressionCodecs = map[string]kgo.CompressionCodec{
@@ -281,6 +294,28 @@ func newKafkaMetrics() *kprom.Metrics {
 	return kprom.NewMetrics("goflow2", kprom.Subsystem("kafka"), kprom.Registerer(prometheus.DefaultRegisterer))
 }
 
+func producerErrorCode(err error) string {
+	var brokerError *kerr.Error
+	switch {
+	case errors.As(err, &brokerError):
+		return strconv.Itoa(int(brokerError.Code))
+	case errors.Is(err, kgo.ErrMaxBuffered):
+		return "max_buffered"
+	case errors.Is(err, kgo.ErrRecordTimeout):
+		return "record_timeout"
+	case errors.Is(err, kgo.ErrRecordRetries):
+		return "record_retries"
+	case errors.Is(err, kgo.ErrClientClosed):
+		return "client_closed"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "other"
+	}
+}
+
 // Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
 	start := time.Now()
@@ -290,9 +325,11 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 		Value: data,
 	}, func(_ *kgo.Record, err error) {
 		if err != nil {
+			producerErrors.WithLabelValues(producerErrorCode(err)).Inc()
 			select {
 			case d.errors <- &KafkaTransportError{err}:
 			default:
+				errorForwardingDropped.Inc()
 			}
 		}
 	})
@@ -322,6 +359,8 @@ func GetServiceAddresses(srv string) (addrs []string, err error) {
 
 func init() {
 	prometheus.MustRegister(enqueueDuration)
+	prometheus.MustRegister(producerErrors)
+	prometheus.MustRegister(errorForwardingDropped)
 	d := &KafkaDriver{
 		errors: make(chan error),
 	}
