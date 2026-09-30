@@ -143,9 +143,12 @@ $ ./goflow2 -transport=kafka \
   -format=bin
 ```
 
-By default, the distribution will be randomized.
-In order to partition the field, you need to configure the `key`
-in the formatter.
+Kafka uses franz-go's adaptive partitioner by default. Records without a key
+are batched across partitions; equal non-nil keys select the same partition.
+Configure the `key` in the formatter, or use `-transport.kafka.hashing=false`
+to ignore keys. Keys may move to different partitions when upgrading from Sarama.
+Avoid running both producer versions against the same topic if consumers require
+per-key ordering during the upgrade.
 
 By default, compression is disabled when sending data to Kafka.
 To change the kafka compression type of the producer side configure the following option:
@@ -153,7 +156,50 @@ To change the kafka compression type of the producer side configure the followin
 ```
 -transport.kafka.compression.type=gzip
 ```
-The list of codecs is available in the [Sarama documentation](https://pkg.go.dev/github.com/Shopify/sarama#CompressionCodec).
+Supported codecs are `none`, `gzip`, `snappy`, `lz4`, and `zstd`.
+
+`-transport.kafka.flushbytes` now caps a record batch rather than setting a flush
+threshold. Batches are also limited by `-transport.kafka.maxmsgbytes`, and
+`-transport.kafka.flushfreq` can override the client's linger time; the default
+`-1ns` leaves it to franz-go (currently 10ms).
+
+The producer uses idempotent writes and acknowledgements from all in-sync
+replicas. Kafka API versions are negotiated automatically unless
+`-transport.kafka.version` sets an explicit maximum. Compression stays disabled
+by default and topics must already exist.
+
+The record buffer defaults to **100,000** records. Configure it with
+`-transport.kafka.maxbufferedrecords=100000`. The producer waits for space when
+this limit is reached; it does not reject records with `TryProduce`. More buffer
+space can absorb bursts but does not fix a sustained processing deficit.
+
+Startup SRV lookup and broker Ping share a 30-second budget, configurable with
+`-transport.kafka.pingtimeout=30s`. Shutdown checks flush progress in five-second
+windows and waits indefinitely by default. To bound shutdown, set
+`-transport.kafka.flushtimeout` for an overall deadline and/or
+`-transport.kafka.flushstalltimeout` for the maximum time without buffer progress.
+Both default to `0` (no deadline). Expiry returns a shutdown error and closes
+the client: outstanding records may be lost, because there is no disk fallback.
+External service-manager kill deadlines can also interrupt an indefinite flush.
+
+When upgrading an existing service, remove explicit `-transport.kafka.version`
+and `-transport.kafka.flushfreq` arguments if you want the new negotiated API
+and default linger behavior. An existing `-transport.kafka.flushfreq=5s` still
+overrides the client default. Compare 10,000 and 100,000 records using the same
+binary and `-transport.kafka.maxbufferedrecords`; wait for the receive queue to
+settle and compare sustained drops, enqueue time, occupancy, and memory at
+comparable load. Restarting the process alone can temporarily hide overload.
+
+When Kafka is in use, producer and broker metrics are available on `/metrics`
+with the `goflow2_kafka_` prefix.
+`goflow2_kafka_producer_buffer_capacity_records` reports the active configured
+record limit. Divide `goflow2_kafka_buffered_produce_records_total` (a gauge)
+by it to monitor occupancy; the buffered gauge also includes callers waiting
+for space, so the ratio can exceed one. Scrapes can miss short buffer peaks.
+`goflow2_kafka_producer_errors_total{code="..."}` counts records that failed
+to produce; `goflow2_kafka_error_forwarding_dropped_total` counts error
+notifications that could not be forwarded for logging. These are distinct from
+UDP packets dropped before processing.
 
 
 By default, the collector will listen for IPFIX/NetFlow V9/NetFlow V5 on port 2055

@@ -8,11 +8,6 @@ on:
   pull_request:
     branches: [ v2 ]
 
-env:
-  # Reuse consistent image names across packaging and manifests.
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/goflow2
-  DOCKERHUB_IMAGE: docker.io/${{ github.repository_owner }}/goflow2
-
 jobs:
   test:
     name: Test
@@ -27,7 +22,7 @@ jobs:
     - name: Set up Go 1.x
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.24
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           go.sum
@@ -98,10 +93,16 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Set image names
+      run: |
+        owner="${GITHUB_REPOSITORY_OWNER,,}"
+        echo "GHCR_IMAGE=ghcr.io/$owner/goflow2" >> "$GITHUB_ENV"
+        echo "DOCKERHUB_IMAGE=docker.io/$owner/goflow2" >> "$GITHUB_ENV"
+
     - name: Set up Go 1.x
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.24
+        go-version: ^1.26
         cache: true
         cache-dependency-path: |
           go.sum
@@ -148,27 +149,27 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Login to DockerHub
-      if: matrix.package && env.DOCKER_PACKAGE == 'true' && github.event_name != 'pull_request'
+      if: matrix.package && env.DOCKER_PACKAGE == 'true' && github.event_name != 'pull_request' && github.repository == 'netsampler/goflow2'
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Log in to GHCR
-      if: matrix.package && env.DOCKER_PACKAGE == 'true' && github.event_name != 'pull_request'
+      if: matrix.package && env.DOCKER_PACKAGE == 'true' && github.event_name != 'pull_request' && github.repository == 'netsampler/goflow2'
       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
 
     - name: Docker package
       if: matrix.package && env.DOCKER_PACKAGE == 'true'
       # PRs load the image locally; main pushes to registries.
       run: |
-        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+        if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.repository }}" != "netsampler/goflow2" ]]; then
           DOCKER_PUSH_FLAG="--load"
         else
           DOCKER_PUSH_FLAG="--push"
         fi
         DOCKER_SUFFIX=-${{ matrix.goarch }} \
-        DOCKER_IMAGE_PREFIXES="${{ env.DOCKERHUB_IMAGE }} ${{ env.GHCR_IMAGE }}" \
+        DOCKER_IMAGE_PREFIXES="$DOCKERHUB_IMAGE $GHCR_IMAGE" \
         DOCKER_CMD="buildx build $DOCKER_PUSH_FLAG --platform $DOCKER_PLATFORM --build-arg BIN_SOURCE=prebuilt --build-arg PREBUILT_BINARY=$PREBUILT_BINARY" \
         make docker
           
@@ -225,12 +226,18 @@ jobs:
     name: Docker Manifests
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.repository == 'netsampler/goflow2'
     steps:
     - name: Check out code into the Go module directory
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+
+    - name: Set image names
+      run: |
+        owner="${GITHUB_REPOSITORY_OWNER,,}"
+        echo "GHCR_IMAGE=ghcr.io/$owner/goflow2" >> "$GITHUB_ENV"
+        echo "DOCKERHUB_IMAGE=docker.io/$owner/goflow2" >> "$GITHUB_ENV"
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -253,7 +260,7 @@ jobs:
       shell: bash
       # Publish branch-specific and v2 tags to both registries.
       run: |
-        images=("${{ env.DOCKERHUB_IMAGE }}" "${{ env.GHCR_IMAGE }}")
+        images=("$DOCKERHUB_IMAGE" "$GHCR_IMAGE")
         for image in "${images[@]}"; do
           DOCKER_IMAGE="$image" make docker-manifest
           DOCKER_IMAGE="$image" DOCKER_MANIFEST_TAG=v2 make docker-manifest
@@ -264,7 +271,7 @@ jobs:
       shell: bash
       # Tag releases get a versioned manifest.
       run: |
-        images=("${{ env.DOCKERHUB_IMAGE }}" "${{ env.GHCR_IMAGE }}")
+        images=("$DOCKERHUB_IMAGE" "$GHCR_IMAGE")
         for image in "${images[@]}"; do
           DOCKER_IMAGE="$image" DOCKER_MANIFEST_TAG="${VERSION}" make docker-manifest
         done
