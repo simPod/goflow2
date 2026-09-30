@@ -92,6 +92,27 @@ func TestStartupPingTimeoutCleansUpClient(t *testing.T) {
 	assert.Nil(t, driver.producer)
 }
 
+func TestHashingFlagControlsKeyAffinity(t *testing.T) {
+	driver := preparedDriver(t)
+	for _, hashing := range []bool{true, false} {
+		driver.kafkaHashing = hashing
+		opts, err := driver.producerOptions()
+		require.NoError(t, err)
+		client, err := kgo.NewClient(opts...)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		partitioner := client.OptValue(kgo.RecordPartitioner).(kgo.Partitioner).ForTopic("flows")
+		assert.Equal(t, hashing, partitioner.RequiresConsistency(&kgo.Record{Key: []byte("exporter")}))
+		if hashing {
+			keyed := partitioner.(kgo.TopicBackupPartitioner)
+			first := keyed.PartitionByBackup(&kgo.Record{Key: []byte("exporter")}, 12, nil)
+			for range 20 {
+				assert.Equal(t, first, keyed.PartitionByBackup(&kgo.Record{Key: []byte("exporter")}, 12, nil))
+			}
+		}
+	}
+}
+
 type testFlushingProducer struct {
 	records int64
 	flush   func(context.Context) error

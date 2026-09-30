@@ -182,6 +182,14 @@ Both default to `0` (no deadline). Expiry returns a shutdown error and closes
 the client: outstanding records may be lost, because there is no disk fallback.
 External service-manager kill deadlines can also interrupt an indefinite flush.
 
+When upgrading an existing service, remove explicit `-transport.kafka.version`
+and `-transport.kafka.flushfreq` arguments if you want the new negotiated API
+and default linger behavior. An existing `-transport.kafka.flushfreq=5s` still
+overrides the client default. Compare 10,000 and 100,000 records using the same
+binary and `-transport.kafka.maxbufferedrecords`; wait for the receive queue to
+settle and compare sustained drops, enqueue time, occupancy, and memory at
+comparable load. Restarting the process alone can temporarily hide overload.
+
 When Kafka is in use, producer and broker metrics are available on `/metrics`
 with the `goflow2_kafka_` prefix.
 `goflow2_kafka_producer_buffer_capacity_records` reports the active configured
