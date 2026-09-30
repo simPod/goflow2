@@ -73,7 +73,7 @@ func TestStartupPingTimeoutCleansUpClient(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _ = io.Copy(io.Discard, conn) // Accept Kafka requests without replying.
 			}()
 		}
