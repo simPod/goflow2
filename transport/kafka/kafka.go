@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/netsampler/goflow2/v2/transport"
@@ -35,19 +36,25 @@ type KafkaDriver struct {
 	kafkaServerCA    string
 	kafkaTlsInsecure bool
 
-	kafkaSASL           string
-	kafkaTopic          string
-	kafkaSrv            string
-	kafkaBrk            string
-	kafkaMaxMsgBytes    int
-	kafkaFlushBytes     int
-	kafkaFlushFrequency time.Duration
+	kafkaSASL               string
+	kafkaTopic              string
+	kafkaSrv                string
+	kafkaBrk                string
+	kafkaMaxMsgBytes        int
+	kafkaFlushBytes         int
+	kafkaFlushFrequency     time.Duration
+	kafkaMaxBufferedRecords int
+	kafkaPingTimeout        time.Duration
+	kafkaFlushTimeout       time.Duration
+	kafkaFlushStallTimeout  time.Duration
 
 	kafkaHashing          bool
 	kafkaVersion          string
 	kafkaCompressionCodec string
 
-	producer *kgo.Client
+	producer     *kgo.Client
+	callbacks    sync.WaitGroup
+	cancelClient context.CancelFunc
 
 	errors chan error
 }
@@ -94,6 +101,12 @@ var (
 		Name:      "error_forwarding_dropped_total",
 		Help:      "Kafka error notifications dropped because the application error channel was not ready.",
 	})
+	producerBufferCapacity = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "goflow2",
+		Subsystem: "kafka",
+		Name:      "producer_buffer_capacity_records",
+		Help:      "Configured record buffer limit for the active Kafka producer.",
+	})
 
 	compressionCodecs = map[string]kgo.CompressionCodec{
 		"none":   kgo.NoCompression(),
@@ -134,11 +147,15 @@ func (d *KafkaDriver) Prepare() error {
 	flag.StringVar(&d.kafkaBrk, "transport.kafka.brokers", "127.0.0.1:9092,[::1]:9092", "Kafka brokers list separated by commas")
 	flag.IntVar(&d.kafkaMaxMsgBytes, "transport.kafka.maxmsgbytes", 1000000, "Kafka max message bytes")
 	flag.IntVar(&d.kafkaFlushBytes, "transport.kafka.flushbytes", 100*1024*1024, "Kafka maximum batch bytes")
-	flag.DurationVar(&d.kafkaFlushFrequency, "transport.kafka.flushfreq", time.Second*5, "Kafka flush frequency")
+	flag.DurationVar(&d.kafkaFlushFrequency, "transport.kafka.flushfreq", -1, "Kafka linger time (-1ns uses the client default)")
+	flag.IntVar(&d.kafkaMaxBufferedRecords, "transport.kafka.maxbufferedrecords", 100000, "Maximum buffered Kafka records")
+	flag.DurationVar(&d.kafkaPingTimeout, "transport.kafka.pingtimeout", 30*time.Second, "Kafka startup timeout, including SRV lookup and Ping")
+	flag.DurationVar(&d.kafkaFlushTimeout, "transport.kafka.flushtimeout", 0, "Maximum Kafka shutdown flush duration (0 waits indefinitely; expiry may lose records)")
+	flag.DurationVar(&d.kafkaFlushStallTimeout, "transport.kafka.flushstalltimeout", 0, "Maximum Kafka shutdown time without buffer progress (0 waits indefinitely; expiry may lose records)")
 
-	flag.BoolVar(&d.kafkaHashing, "transport.kafka.hashing", false, "Enable partition hashing")
+	flag.BoolVar(&d.kafkaHashing, "transport.kafka.hashing", true, "Hash non-nil keys with the adaptive partitioner; false ignores keys")
 
-	flag.StringVar(&d.kafkaVersion, "transport.kafka.version", "2.8.0", "Kafka version")
+	flag.StringVar(&d.kafkaVersion, "transport.kafka.version", "", "Optional maximum Kafka version (empty negotiates automatically)")
 	flag.StringVar(&d.kafkaCompressionCodec, "transport.kafka.compression", "", "Kafka default compression")
 
 	return nil
@@ -151,30 +168,87 @@ func (d *KafkaDriver) Errors() <-chan error {
 
 // Init configures the Kafka producer and establishes connections.
 func (d *KafkaDriver) Init() error {
-	kafkaConfigVersion := kversion.FromString(d.kafkaVersion)
-	if kafkaConfigVersion == nil {
-		return fmt.Errorf("invalid Kafka version %q", d.kafkaVersion)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.kafkaPingTimeout)
+	defer cancel()
+	return d.initProducer(ctx)
+}
 
+func (d *KafkaDriver) initProducer(ctx context.Context) error {
+	opts, err := d.producerOptions()
+	if err != nil {
+		return err
+	}
+	var addrs []string
+	if d.kafkaSrv != "" {
+		addrs, err = getServiceAddresses(ctx, d.kafkaSrv)
+		if err != nil {
+			return err
+		}
+	} else {
+		addrs = strings.Split(d.kafkaBrk, ",")
+	}
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	opts = append(opts, kgo.SeedBrokers(addrs...), kgo.WithHooks(newKafkaMetrics()), kgo.WithContext(clientCtx))
+	kafkaProducer, err := kgo.NewClient(opts...)
+	if err != nil {
+		cancelClient()
+		return err
+	}
+	pingErrors := make(chan error, 1)
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		pingErrors <- kafkaProducer.Ping(ctx)
+	}()
+	select {
+	case err = <-pingErrors:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if err != nil {
+		cancelClient()
+		kafkaProducer.Close()
+		<-pingDone
+		return fmt.Errorf("kafka startup ping: %w", err)
+	}
+	<-pingDone
+	d.producer = kafkaProducer
+	d.cancelClient = cancelClient
+	producerBufferCapacity.Set(float64(d.kafkaMaxBufferedRecords))
+	return nil
+}
+
+func (d *KafkaDriver) producerOptions() ([]kgo.Opt, error) {
 	if d.kafkaMaxMsgBytes <= 0 || d.kafkaFlushBytes <= 0 || d.kafkaMaxMsgBytes > int(^uint32(0)>>1) || d.kafkaFlushBytes > int(^uint32(0)>>1) {
-		return errors.New("kafka message and batch byte limits must be positive and at most 2147483647")
+		return nil, errors.New("kafka message and batch byte limits must be positive and at most 2147483647")
+	}
+	if d.kafkaMaxBufferedRecords <= 0 {
+		return nil, errors.New("transport.kafka.maxbufferedrecords must be positive")
+	}
+	if d.kafkaPingTimeout <= 0 || d.kafkaFlushTimeout < 0 || d.kafkaFlushStallTimeout < 0 || d.kafkaFlushFrequency < -1 {
+		return nil, errors.New("kafka ping timeout must be positive, flush timeouts nonnegative, and linger at least -1ns")
 	}
 	batchBytes := min(d.kafkaMaxMsgBytes, d.kafkaFlushBytes)
 	opts := []kgo.Opt{
-		kgo.MaxVersions(kafkaConfigVersion),
 		kgo.ProducerBatchMaxBytes(int32(batchBytes)),
-		kgo.ProducerLinger(d.kafkaFlushFrequency),
-		kgo.RecordPartitioner(kgo.RoundRobinPartitioner()),
+		kgo.MaxBufferedRecords(d.kafkaMaxBufferedRecords),
 		kgo.ProducerBatchCompression(kgo.NoCompression()),
-		kgo.DisableIdempotentWrite(),
-		kgo.RequiredAcks(kgo.LeaderAck()),
-		kgo.WithHooks(newKafkaMetrics()),
+	}
+	if d.kafkaVersion != "" {
+		version := kversion.FromString(d.kafkaVersion)
+		if version == nil {
+			return nil, fmt.Errorf("invalid Kafka version %q", d.kafkaVersion)
+		}
+		opts = append(opts, kgo.MaxVersions(version))
+	}
+	if d.kafkaFlushFrequency >= 0 {
+		opts = append(opts, kgo.ProducerLinger(d.kafkaFlushFrequency))
 	}
 
 	if d.kafkaCompressionCodec != "" {
 		cc, ok := compressionCodecs[strings.ToLower(d.kafkaCompressionCodec)]
 		if !ok {
-			return fmt.Errorf("compression codec does not exist")
+			return nil, fmt.Errorf("compression codec does not exist")
 		}
 		opts = append(opts, kgo.ProducerBatchCompression(cc))
 	}
@@ -182,7 +256,7 @@ func (d *KafkaDriver) Init() error {
 	if d.kafkaTLS {
 		rootCAs, err := x509.SystemCertPool()
 		if err != nil {
-			return fmt.Errorf("error initializing TLS: %v", err)
+			return nil, fmt.Errorf("error initializing TLS: %v", err)
 		}
 		tlsConfig := &tls.Config{
 			RootCAs:    rootCAs,
@@ -194,25 +268,28 @@ func (d *KafkaDriver) Init() error {
 		if d.kafkaServerCA != "" {
 			serverCaFile, err := os.Open(d.kafkaServerCA)
 			if err != nil {
-				return fmt.Errorf("error initializing server CA: %v", err)
+				return nil, fmt.Errorf("error initializing server CA: %v", err)
 			}
 
 			serverCaBytes, err := io.ReadAll(serverCaFile)
 			if err != nil {
 				if closeErr := serverCaFile.Close(); closeErr != nil {
-					return fmt.Errorf("error closing server CA: %v", closeErr)
+					return nil, fmt.Errorf("error closing server CA: %v", closeErr)
 				}
-				return fmt.Errorf("error reading server CA: %v", err)
+				return nil, fmt.Errorf("error reading server CA: %v", err)
 			}
 			if err := serverCaFile.Close(); err != nil {
-				return fmt.Errorf("error closing server CA: %v", err)
+				return nil, fmt.Errorf("error closing server CA: %v", err)
 			}
 
 			block, _ := pem.Decode(serverCaBytes)
+			if block == nil {
+				return nil, errors.New("error parsing server CA: no PEM certificate found")
+			}
 
 			serverCa, err := x509.ParseCertificate(block.Bytes)
 			if err != nil {
-				return fmt.Errorf("error parsing server CA: %v", err)
+				return nil, fmt.Errorf("error parsing server CA: %v", err)
 			}
 
 			certPool := x509.NewCertPool()
@@ -224,7 +301,7 @@ func (d *KafkaDriver) Init() error {
 		if d.kafkaClientCert != "" && d.kafkaClientKey != "" {
 			_, err := tls.LoadX509KeyPair(d.kafkaClientCert, d.kafkaClientKey)
 			if err != nil {
-				return fmt.Errorf("error initializing mTLS: %v", err)
+				return nil, fmt.Errorf("error initializing mTLS: %v", err)
 			}
 
 			tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
@@ -238,21 +315,21 @@ func (d *KafkaDriver) Init() error {
 		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
 	}
 
-	if d.kafkaHashing {
-		opts = append(opts, kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)))
+	if !d.kafkaHashing {
+		opts = append(opts, kgo.RecordPartitioner(kgo.UniformBytesPartitioner(64<<10, true, false, nil)))
 	}
 
-	kafkaSASL := KafkaSASLAlgorithm(d.kafkaSASL)
+	kafkaSASL := KafkaSASLAlgorithm(strings.ToLower(d.kafkaSASL))
 	if d.kafkaSASL != "" && kafkaSASL != KAFKA_SASL_NONE {
 		_, ok := saslAlgorithms[KafkaSASLAlgorithm(strings.ToLower(d.kafkaSASL))]
 		if !ok {
-			return errors.New("sasl algorithm does not exist")
+			return nil, errors.New("sasl algorithm does not exist")
 		}
 
 		user := os.Getenv("KAFKA_SASL_USER")
 		password := os.Getenv("KAFKA_SASL_PASS")
 		if user == "" && password == "" {
-			return fmt.Errorf("kafka SASL config from environment was unsuccessful: KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set")
+			return nil, fmt.Errorf("kafka SASL config from environment was unsuccessful: KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set")
 		}
 
 		switch kafkaSASL {
@@ -265,29 +342,7 @@ func (d *KafkaDriver) Init() error {
 		}
 	}
 
-	var addrs []string
-	if d.kafkaSrv != "" {
-		var err error
-		addrs, err = GetServiceAddresses(d.kafkaSrv)
-		if err != nil {
-			return err
-		}
-	} else {
-		addrs = strings.Split(d.kafkaBrk, ",")
-	}
-
-	opts = append(opts, kgo.SeedBrokers(addrs...))
-	kafkaProducer, err := kgo.NewClient(opts...)
-	if err != nil {
-		return err
-	}
-	if err := kafkaProducer.Ping(context.Background()); err != nil {
-		kafkaProducer.Close()
-		return err
-	}
-	d.producer = kafkaProducer
-
-	return nil
+	return opts, nil
 }
 
 func newKafkaMetrics() *kprom.Metrics {
@@ -319,11 +374,13 @@ func producerErrorCode(err error) string {
 // Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
 	start := time.Now()
+	d.callbacks.Add(1)
 	d.producer.Produce(context.Background(), &kgo.Record{
 		Topic: d.kafkaTopic,
 		Key:   key,
 		Value: data,
 	}, func(_ *kgo.Record, err error) {
+		defer d.callbacks.Done()
 		if err != nil {
 			producerErrors.WithLabelValues(producerErrorCode(err)).Inc()
 			select {
@@ -337,19 +394,75 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 	return nil
 }
 
-// Close stops the producer and releases resources.
+// Close stops the producer and releases resources. Callers must stop Send first.
 func (d *KafkaDriver) Close() error {
-	err := d.producer.Flush(context.Background())
+	ctx := context.Background()
+	if d.kafkaFlushTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.kafkaFlushTimeout)
+		defer cancel()
+	}
+	err := flushWhileProgressing(ctx, d.producer, 5*time.Second, d.kafkaFlushStallTimeout)
+	if err != nil {
+		err = fmt.Errorf("kafka shutdown flush: %w (%d outstanding records may not be delivered; no disk fallback)", err, d.producer.BufferedProduceRecords())
+	}
+	if d.cancelClient != nil {
+		d.cancelClient()
+	}
 	d.producer.Close()
+	d.callbacks.Wait()
 	close(d.errors)
+	producerBufferCapacity.Set(0)
 	return err
+}
+
+type flushingProducer interface {
+	Flush(context.Context) error
+	BufferedProduceRecords() int64
+}
+
+func flushWhileProgressing(ctx context.Context, producer flushingProducer, interval, stallTimeout time.Duration) error {
+	lastProgress := time.Now()
+	for {
+		before := producer.BufferedProduceRecords()
+		if before == 0 {
+			return nil
+		}
+		window := interval
+		if stallTimeout > 0 {
+			remaining := stallTimeout - time.Since(lastProgress)
+			if remaining <= 0 {
+				return fmt.Errorf("no flush progress for %s: %w", stallTimeout, context.DeadlineExceeded)
+			}
+			window = min(window, remaining)
+		}
+		flushCtx, cancel := context.WithTimeout(ctx, window)
+		err := producer.Flush(flushCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if producer.BufferedProduceRecords() < before {
+			lastProgress = time.Now()
+		}
+	}
 }
 
 // GetServiceAddresses resolves SRV records into broker addresses.
 func GetServiceAddresses(srv string) (addrs []string, err error) {
-	_, srvs, err := net.LookupSRV("", "", srv)
+	return getServiceAddresses(context.Background(), srv)
+}
+
+func getServiceAddresses(ctx context.Context, srv string) (addrs []string, err error) {
+	_, srvs, err := net.DefaultResolver.LookupSRV(ctx, "", "", srv)
 	if err != nil {
-		return nil, fmt.Errorf("service discovery: %v", err)
+		return nil, fmt.Errorf("service discovery: %w", err)
 	}
 	for _, srv := range srvs {
 		addrs = append(addrs, net.JoinHostPort(srv.Target, strconv.Itoa(int(srv.Port))))
@@ -361,6 +474,7 @@ func init() {
 	prometheus.MustRegister(enqueueDuration)
 	prometheus.MustRegister(producerErrors)
 	prometheus.MustRegister(errorForwardingDropped)
+	prometheus.MustRegister(producerBufferCapacity)
 	d := &KafkaDriver{
 		errors: make(chan error),
 	}
